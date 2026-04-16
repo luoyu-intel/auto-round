@@ -296,7 +296,7 @@ def quant_tensor_rtn_asym(tensor, bits=4, group_size=-1, v=0, q_scale_thresh=1e-
 
         imatrix = _imatrix_handle_zero(imatrix, tensor, bits)
     if True:
-        q, scale, zp =t_dyn_quant(tensor, bits=bits, dir=-1, asym=True, iter=20, qw=imatrix)
+        q, scale, zp =t_dyn_quant(tensor, bits=bits, dir=-1, asym=True, iter=100, qw=imatrix)
     else:
         scale, zp = search_scales_zp(tensor, bits, qw=imatrix)
         scale = torch.where(scale < 0, torch.clamp(scale, max=-q_scale_thresh), torch.clamp(scale, min=q_scale_thresh))

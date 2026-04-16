@@ -34,14 +34,14 @@ unset AUTO_ROUND_IMATRIX_FILE
 BASE_OUTPUT_DIR="${OUTPUT_DIR}/${MODEL_NAME}-${SUFFIX}"
 rm -rf "$BASE_OUTPUT_DIR"
 
-auto-round --model "$MODEL_PATH" --scheme "$SCHEME" --format "fake" --iters 200 --output_dir "$OUTPUT_DIR" --asym
+auto-round --model "$MODEL_PATH" --scheme "$SCHEME" --format "fake" --iters 200 --output_dir "$OUTPUT_DIR"
 
 
 
 python get_residual.py -i "$MODEL_PATH" -q "$BASE_OUTPUT_DIR" -o "${OUTPUT_R0_DIR}" --operation sub --device cuda
 
 export AUTO_ROUND_LOAD_IMATRIX_FILE="${OUTPUT_ROOT%/}/imatrix.pt"
-auto-round --model "$OUTPUT_R0_DIR" --scheme "$SCHEME" --format "fake" --iters 0 --output_dir "$OUTPUT_R0_OUTPUT_DIR"
+auto-round --model "$OUTPUT_R0_DIR" --scheme "$SCHEME" --format "fake" --iters 0 --output_dir "$OUTPUT_R0_OUTPUT_DIR" --asym
 unset AUTO_ROUND_LOAD_IMATRIX_FILE
 R0_OUTPUT_DIR="${OUTPUT_R0_OUTPUT_DIR}/${MODEL_NAME}-${SCHEME}-R0-${SUFFIX}"
 
