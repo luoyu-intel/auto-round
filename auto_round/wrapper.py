@@ -57,6 +57,78 @@ def get_scale_shape(weight, group_size):
     return shape
 
 
+def save_imatrix_to_file(global_name, imatrix):
+    """Persist an ``imatrix`` tensor into a torch file keyed by ``global_name``.
+
+    The output file path is read from the ``AUTO_ROUND_IMATRIX_FILE`` environment variable.
+    Each call reloads the existing file, updates one key, and saves it back.
+
+    Args:
+        global_name (str): Layer identifier used as the dictionary key.
+        imatrix (torch.Tensor): Tensor to persist.
+    """
+    file_path = os.environ.get("AUTO_ROUND_IMATRIX_FILE")
+    if not file_path or imatrix is None:
+        return
+    file_path = os.path.abspath(os.path.expandvars(os.path.expanduser(file_path)))
+
+    data = {}
+    if os.path.exists(file_path):
+        try:
+            loaded = torch.load(file_path, map_location="cpu")
+            if isinstance(loaded, dict):
+                data = loaded
+            else:
+                logger.warning("Ignoring non-dict imatrix file: %s", file_path)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to load imatrix file %s: %s", file_path, exc)
+
+    dir_path = os.path.dirname(file_path)
+    if dir_path:
+        os.makedirs(dir_path, exist_ok=True)
+
+    data[global_name] = imatrix.detach().to("cpu")
+    torch.save(data, file_path)
+
+
+def load_imatrix_from_file(global_name, imatrix):
+    """Load an ``imatrix`` tensor from a torch file keyed by ``global_name``.
+
+    The input file path is read from the ``AUTO_ROUND_LOAD_IMATRIX_FILE`` environment variable.
+    If the file or key is missing, the original ``imatrix`` is returned unchanged.
+
+    Args:
+        global_name (str): Layer identifier used as the dictionary key.
+        imatrix (torch.Tensor): Fallback tensor when no saved value is found.
+
+    Returns:
+        torch.Tensor: Loaded tensor if available, otherwise the original tensor.
+    """
+    file_path = os.environ.get("AUTO_ROUND_LOAD_IMATRIX_FILE")
+    if not file_path or imatrix is None:
+        return imatrix
+    file_path = os.path.abspath(os.path.expandvars(os.path.expanduser(file_path)))
+
+    if not os.path.exists(file_path):
+        logger.warning("imatrix load file does not exist: %s", file_path)
+        return imatrix
+
+    try:
+        loaded = torch.load(file_path, map_location="cpu")
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Failed to load imatrix file %s: %s", file_path, exc)
+        return imatrix
+
+    if not isinstance(loaded, dict):
+        logger.warning("Ignoring non-dict imatrix file: %s", file_path)
+        return imatrix
+
+    loaded_imatrix = loaded.get(global_name)
+    if loaded_imatrix is None:
+        return imatrix
+
+    return loaded_imatrix.to(device=imatrix.device, dtype=imatrix.dtype)
+
 class WrapperLinear(torch.nn.Module):
     """A wrapper for linear/conv1d layers to enable quantization and tuning.
 
@@ -233,7 +305,10 @@ class WrapperLinear(torch.nn.Module):
         if hasattr(self.orig_layer, "super_bits"):
             quant_kwargs["super_bits"] = self.orig_layer.super_bits
             quant_kwargs["super_group_size"] = self.orig_layer.super_group_size
-
+        if hasattr(self.orig_layer, "imatrix"):
+            self.orig_layer.imatrix = load_imatrix_from_file(self.orig_layer.global_name, self.orig_layer.imatrix)
+            save_imatrix_to_file(self.orig_layer.global_name, self.orig_layer.imatrix)
+            
         weight_q, scale, zp = self.weight_quant_func(
             weight.to(self.device),
             bits=self.orig_layer.bits,
