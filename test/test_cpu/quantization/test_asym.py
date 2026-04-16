@@ -7,6 +7,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoRoundConfig, AutoTokenizer
 
 from auto_round import AutoRound
+from auto_round.data_type.int import search_scales_zp
 
 from ...helpers import get_model_path, model_infer
 
@@ -80,3 +81,34 @@ class TestAutoRoundAsym:
 
             tokenizer = AutoTokenizer.from_pretrained(self.save_folder)
             model_infer(model, tokenizer)
+
+    def test_search_scales_zp(self):
+        data = torch.tensor(
+            [[-1.2, -0.4, 0.3, 1.7], [-0.1, 0.0, 0.8, 2.1]],
+            dtype=torch.float32,
+        )
+        weights = torch.tensor(
+            [[1.0, 2.0, 0.5, 1.5], [0.1, 1.0, 3.0, 2.0]],
+            dtype=torch.float32,
+        )
+        bits = 4
+        maxq = 2**bits - 1
+
+        scale, zp = search_scales_zp(data, bits, qw=weights)
+
+        baseline_min = torch.min(data, dim=-1, keepdim=True)[0]
+        baseline_max = torch.max(data, dim=-1, keepdim=True)[0]
+        baseline_scale = torch.clamp((baseline_max - baseline_min) / maxq, min=1e-5)
+        baseline_zp = torch.clamp(torch.round(-baseline_min / baseline_scale), 0, maxq)
+
+        q = torch.clamp(torch.round(data / scale + zp), 0, maxq)
+        baseline_q = torch.clamp(torch.round(data / baseline_scale + baseline_zp), 0, maxq)
+        loss = torch.sum(weights * (scale * (q - zp) - data) ** 2, dim=-1)
+        baseline_loss = torch.sum(weights * (baseline_scale * (baseline_q - baseline_zp) - data) ** 2, dim=-1)
+
+        assert scale.shape == (data.shape[0], 1)
+        assert zp.shape == (data.shape[0], 1)
+        assert torch.all(zp >= 0)
+        assert torch.all(zp <= maxq)
+        assert torch.allclose(zp, torch.round(zp))
+        assert torch.all(loss <= baseline_loss + 1e-6)
