@@ -28,20 +28,20 @@ OUTPUT_R0_OUTPUT_MERGE_DIR="${OUTPUT_ROOT%/}/${MODEL_NAME}-${SCHEME}-R0-${SCHEME
 
 export AUTO_ROUND_IMATRIX_FILE="${OUTPUT_ROOT%/}/imatrix.pt"
 # save the intermediate imatrix for auto-rounding
-auto-round --model "$MODEL_PATH" --scheme "$SCHEME"  --iters 0 --output_dir "$OUTPUT_DIR"
+python -m auto_round --model "$MODEL_PATH" --scheme "$SCHEME"  --iters 0 --output_dir "$OUTPUT_DIR"
 unset AUTO_ROUND_IMATRIX_FILE
 
 BASE_OUTPUT_DIR="${OUTPUT_DIR}/${MODEL_NAME}-${SUFFIX}"
 rm -rf "$BASE_OUTPUT_DIR"
 
 
-auto-round-best --enable_alg_ext --lr 2e-3 --model "$MODEL_PATH" --scheme "$SCHEME" --format "fake" --output_dir "$OUTPUT_DIR"
-
+auto-round-best --enable_alg_ext --lr 2e-3 --model "$MODEL_PATH" --scheme "$SCHEME" --format "fake" --output_dir "$OUTPUT_DIR" --low_gpu_mem_usage --enable_torch_compile
+	
 
 python get_residual.py -i "$MODEL_PATH" -q "$BASE_OUTPUT_DIR" -o "${OUTPUT_R0_DIR}" --operation sub --device cuda
 
 export AUTO_ROUND_LOAD_IMATRIX_FILE="${OUTPUT_ROOT%/}/imatrix.pt"
-auto-round --model "$OUTPUT_R0_DIR" --scheme "$SCHEME" --format "fake" --iters 0 --output_dir "$OUTPUT_R0_OUTPUT_DIR" --asym
+python -m auto_round --model "$OUTPUT_R0_DIR" --scheme "$SCHEME" --format "fake" --iters 0 --output_dir "$OUTPUT_R0_OUTPUT_DIR" --asym
 unset AUTO_ROUND_LOAD_IMATRIX_FILE
 R0_OUTPUT_DIR="${OUTPUT_R0_OUTPUT_DIR}/${MODEL_NAME}-${SCHEME}-R0-${SUFFIX}"
 

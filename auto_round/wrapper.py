@@ -91,7 +91,7 @@ def save_imatrix_to_file(global_name, imatrix):
     torch.save(data, file_path)
 
 
-def load_imatrix_from_file(global_name, imatrix):
+def load_imatrix_from_file(global_name, weight):
     """Load an ``imatrix`` tensor from a torch file keyed by ``global_name``.
 
     The input file path is read from the ``AUTO_ROUND_LOAD_IMATRIX_FILE`` environment variable.
@@ -99,35 +99,35 @@ def load_imatrix_from_file(global_name, imatrix):
 
     Args:
         global_name (str): Layer identifier used as the dictionary key.
-        imatrix (torch.Tensor): Fallback tensor when no saved value is found.
+        weight (torch.Tensor): Fallback tensor when no saved value is found.
 
     Returns:
         torch.Tensor: Loaded tensor if available, otherwise the original tensor.
     """
     file_path = os.environ.get("AUTO_ROUND_LOAD_IMATRIX_FILE")
-    if not file_path or imatrix is None:
-        return imatrix
+    if not file_path or weight is None:
+        return None
     file_path = os.path.abspath(os.path.expandvars(os.path.expanduser(file_path)))
 
     if not os.path.exists(file_path):
         logger.warning("imatrix load file does not exist: %s", file_path)
-        return imatrix
+        return None
 
     try:
         loaded = torch.load(file_path, map_location="cpu")
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("Failed to load imatrix file %s: %s", file_path, exc)
-        return imatrix
+        return None
 
     if not isinstance(loaded, dict):
         logger.warning("Ignoring non-dict imatrix file: %s", file_path)
-        return imatrix
+        return None
 
     loaded_imatrix = loaded.get(global_name)
     if loaded_imatrix is None:
-        return imatrix
+        return None
 
-    return loaded_imatrix.to(device=imatrix.device, dtype=imatrix.dtype)
+    return loaded_imatrix.to(device=weight.device, dtype=weight.dtype)
 
 class WrapperLinear(torch.nn.Module):
     """A wrapper for linear/conv1d layers to enable quantization and tuning.
@@ -305,8 +305,9 @@ class WrapperLinear(torch.nn.Module):
         if hasattr(self.orig_layer, "super_bits"):
             quant_kwargs["super_bits"] = self.orig_layer.super_bits
             quant_kwargs["super_group_size"] = self.orig_layer.super_group_size
+        ext_imatrix = load_imatrix_from_file(self.orig_layer.global_name, weight)
+        ld_imatrix = ext_imatrix if ext_imatrix is not None else getattr(self.orig_layer, "imatrix", None)
         if hasattr(self.orig_layer, "imatrix"):
-            self.orig_layer.imatrix = load_imatrix_from_file(self.orig_layer.global_name, self.orig_layer.imatrix)
             save_imatrix_to_file(self.orig_layer.global_name, self.orig_layer.imatrix)
             
         weight_q, scale, zp = self.weight_quant_func(
@@ -321,7 +322,7 @@ class WrapperLinear(torch.nn.Module):
             tensor_max=self.weight_max,
             data_type=self.data_type,
             q_scale_thresh=self.q_scale_thresh,
-            imatrix=self.orig_layer.imatrix.to(weight.device) if hasattr(self.orig_layer, "imatrix") else None,
+            imatrix=ld_imatrix,
             global_scale=getattr(self, "weight_global_scale", None),
             **quant_kwargs,
         )

@@ -173,9 +173,9 @@ def t_dyn_quant(arr, bits=4, dir=-1, asym=True, iter=2, qw=None):
         scale0 = 1 / scale0
         dq0 = t_dequant_weight([qarr0, scale0, zero_point0], [], arr.shape)
         err0 = abs(arr - dq0)
-        err0 = torch.sum(err0, dim=dir, keepdim=True)
         if qw is not None:
             err0.mul_(qw)
+        err0 = torch.sum(err0, dim=dir, keepdim=True)
         return err0, qarr0, scale0, zero_point0
 
     if asym:
@@ -206,9 +206,9 @@ def t_dyn_quant(arr, bits=4, dir=-1, asym=True, iter=2, qw=None):
         qarr1 = torch.clamp(qarr1, -FullQ, FullQ - 1)
         dq1 = t_dequant_weight([qarr1, scale1], [], arr.shape)
         err1 = abs(arr - dq1)
-        err1 = torch.sum(err1, dim=dir, keepdim=True)
         if qw is not None:
             err1.mul_(qw)
+        err1 = torch.sum(err1, dim=dir, keepdim=True)
         return err1, qarr1, scale1
 
     StartQ = FullQ
