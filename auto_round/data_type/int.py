@@ -99,6 +99,55 @@ def _compute_asym_search_loss(
     return torch.sum(loss, dim=-1, keepdim=True)
 
 
+def _quantize_asym(data: torch.Tensor, scale: torch.Tensor, zp: torch.Tensor, maxq: int) -> torch.Tensor:
+    inverse_scale = get_reciprocal(scale)
+    q = torch.empty_like(data)
+    torch.round(data * inverse_scale + zp, out=q)
+    q.clamp_(0, maxq)
+    return q
+
+
+def _refine_asym_scale_zp(
+    data: torch.Tensor,
+    bits: int,
+    scale: torch.Tensor,
+    zp: torch.Tensor,
+    qw: Union[None, torch.Tensor, float] = None,
+    q_scale_thresh: float = 1e-5,
+    search_steps: int = 2,
+    step_size: float = 0.02,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    maxq = 2**bits - 1
+    best_scale = scale.clone()
+    best_zp = zp.clone()
+    best_loss = _compute_asym_search_loss(data, best_scale, best_zp, maxq, qw=qw)
+
+    group_min = -best_zp * best_scale
+    group_max = (maxq - best_zp) * best_scale
+    group_range = torch.clamp(group_max - group_min, min=q_scale_thresh * maxq)
+
+    for min_step in range(-search_steps, search_steps + 1):
+        candidate_min = group_min + min_step * step_size * group_range
+        for max_step in range(-search_steps, search_steps + 1):
+            if min_step == 0 and max_step == 0:
+                continue
+
+            candidate_max = group_max + max_step * step_size * group_range
+            valid = candidate_max > candidate_min
+            candidate_scale = torch.clamp((candidate_max - candidate_min) / maxq, min=q_scale_thresh)
+            candidate_zp = torch.clamp(torch.round(-candidate_min * get_reciprocal(candidate_scale)), 0, maxq)
+            loss = _compute_asym_search_loss(data, candidate_scale, candidate_zp, maxq, qw=qw)
+
+            replace_id = valid & (loss < best_loss)
+            if replace_id.any():
+                best_scale = torch.where(replace_id, candidate_scale, best_scale)
+                best_zp = torch.where(replace_id, candidate_zp, best_zp)
+                best_loss = torch.where(replace_id, loss, best_loss)
+
+    q = _quantize_asym(data, best_scale, best_zp, maxq)
+    return q, best_scale, best_zp, best_loss
+
+
 def search_scales_zp(
     data: torch.Tensor,
     bits: int,
@@ -139,20 +188,20 @@ def search_scales_zp(
 
     return scale, zp
 
-def t_DQ(Q):
+def dequantize_tensor_components(Q):
     if len(Q) == 3:
         return (Q[0] - Q[2]) * Q[1]
     return Q[0] * Q[1]
 
 
-def t_dequant_weight(Q_main, Q_res, shape, n_iter=100):
-    dq = t_DQ(Q_main).reshape(shape)
+def dequantize_weight_components(Q_main, Q_res, shape, n_iter=100):
+    dq = dequantize_tensor_components(Q_main).reshape(shape)
     n = min(len(Q_res), n_iter)
     for i in range(n):
-        dq += t_DQ(Q_res[i]).reshape(shape)
+        dq += dequantize_tensor_components(Q_res[i]).reshape(shape)
     return dq
 
-def t_dyn_quant(arr, bits=4, dir=-1, asym=True, iter=2, qw=None):
+def dynamic_quantize_tensor(arr, bits=4, dir=-1, asym=True, iter=2, qw=None):
     a_min = arr.min(dir, keepdim=True)[0]
     a_min = torch.clamp(a_min, max=0)
     a_max = arr.max(dir, keepdim=True)[0]
@@ -164,18 +213,23 @@ def t_dyn_quant(arr, bits=4, dir=-1, asym=True, iter=2, qw=None):
     FullQ = 1 << (bits - 1)
     denorm = a_max - a_min
 
-    def asym_quant_iter(_Q):
-        scale0 = _Q / denorm
-        scale0[denorm.abs() <= 1e-4] = 1
-        zero_point0 = torch.round(-a_min * scale0)
-        zero_point0 = torch.clamp(zero_point0, 0, Q) - FullQ
-        qarr0 = torch.clamp(torch.round(arr * scale0 + zero_point0), 0, Q) - FullQ
-        scale0 = 1 / scale0
-        dq0 = t_dequant_weight([qarr0, scale0, zero_point0], [], arr.shape)
-        err0 = abs(arr - dq0)
+    def reconstruction_error(dq):
+        err = (arr - dq).to(torch.float32).pow_(2)
         if qw is not None:
-            err0.mul_(qw)
-        err0 = torch.sum(err0, dim=dir, keepdim=True)
+            err.mul_(qw)
+        return torch.sum(err, dim=dir, keepdim=True)
+
+    def asym_quant_iter(_Q):
+        inverse_scale0 = _Q / denorm
+        inverse_scale0[denorm.abs() <= 1e-4] = 1
+        zero_point0 = torch.round(-a_min * inverse_scale0)
+        zero_point0 = torch.clamp(zero_point0, 0, Q)
+        qarr0 = _quantize_asym(arr, get_reciprocal(inverse_scale0), zero_point0, Q)
+        scale0 = 1 / inverse_scale0
+        zero_point0 = zero_point0 - FullQ
+        qarr0 = qarr0 - FullQ
+        dq0 = dequantize_weight_components([qarr0, scale0, zero_point0], [], arr.shape)
+        err0 = reconstruction_error(dq0)
         return err0, qarr0, scale0, zero_point0
 
     if asym:
@@ -191,6 +245,20 @@ def t_dyn_quant(arr, bits=4, dir=-1, asym=True, iter=2, qw=None):
                 zero_point = torch.where(_ret[0] < err, _ret[3], zero_point)
                 err = torch.where(_ret[0] < err, _ret[0], err)
                 StartQ += delta
+        qarr_refined, scale_refined, zero_point_refined, err_refined = _refine_asym_scale_zp(
+            arr,
+            bits,
+            scale,
+            zero_point + FullQ,
+            qw=qw,
+        )
+        qarr_refined = qarr_refined - FullQ
+        zero_point_refined = zero_point_refined - FullQ
+        refine_id = err_refined < err
+        qarr = torch.where(refine_id, qarr_refined, qarr)
+        scale = torch.where(refine_id, scale_refined, scale)
+        zero_point = torch.where(refine_id, zero_point_refined, zero_point)
+        err = torch.where(refine_id, err_refined, err)
         qarr_a = qarr
         scale_a = scale
         zero_point_a = zero_point
@@ -204,11 +272,8 @@ def t_dyn_quant(arr, bits=4, dir=-1, asym=True, iter=2, qw=None):
         qarr1 = arr / scale1
         qarr1 = torch.round(qarr1)
         qarr1 = torch.clamp(qarr1, -FullQ, FullQ - 1)
-        dq1 = t_dequant_weight([qarr1, scale1], [], arr.shape)
-        err1 = abs(arr - dq1)
-        if qw is not None:
-            err1.mul_(qw)
-        err1 = torch.sum(err1, dim=dir, keepdim=True)
+        dq1 = dequantize_weight_components([qarr1, scale1], [], arr.shape)
+        err1 = reconstruction_error(dq1)
         return err1, qarr1, scale1
 
     StartQ = FullQ
@@ -296,7 +361,7 @@ def quant_tensor_rtn_asym(tensor, bits=4, group_size=-1, v=0, q_scale_thresh=1e-
 
         imatrix = _imatrix_handle_zero(imatrix, tensor, bits)
     if True:
-        q, scale, zp =t_dyn_quant(tensor, bits=bits, dir=-1, asym=True, iter=100, qw=imatrix)
+        q, scale, zp = dynamic_quantize_tensor(tensor, bits=bits, dir=-1, asym=True, iter=100, qw=imatrix)
     else:
         scale, zp = search_scales_zp(tensor, bits, qw=imatrix)
         scale = torch.where(scale < 0, torch.clamp(scale, max=-q_scale_thresh), torch.clamp(scale, min=q_scale_thresh))
