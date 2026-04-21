@@ -21,6 +21,9 @@ from auto_round.logger import logger
 from auto_round.utils import get_reciprocal
 
 
+DEFAULT_DYNAMIC_QUANT_ITER = 48
+
+
 def search_scales(data: torch.Tensor, bits: int, qw: Union[None, torch.Tensor, float] = None) -> torch.Tensor:
     # Maximum absolute value for symmetric quantization
     nmax = 1 << (bits - 1)  # equivalent to pow(2, bits-1)
@@ -201,7 +204,7 @@ def dequantize_weight_components(Q_main, Q_res, shape, n_iter=100):
         dq += dequantize_tensor_components(Q_res[i]).reshape(shape)
     return dq
 
-def dynamic_quantize_tensor(arr, bits=4, dir=-1, asym=True, iter=2, qw=None):
+def dynamic_quantize_tensor(arr, bits=4, dir=-1, asym=True, iter=DEFAULT_DYNAMIC_QUANT_ITER, qw=None):
     a_min = arr.min(dir, keepdim=True)[0]
     a_min = torch.clamp(a_min, max=0)
     a_max = arr.max(dir, keepdim=True)[0]
@@ -361,7 +364,14 @@ def quant_tensor_rtn_asym(tensor, bits=4, group_size=-1, v=0, q_scale_thresh=1e-
 
         imatrix = _imatrix_handle_zero(imatrix, tensor, bits)
     if True:
-        q, scale, zp = dynamic_quantize_tensor(tensor, bits=bits, dir=-1, asym=True, iter=100, qw=imatrix)
+        q, scale, zp = dynamic_quantize_tensor(
+            tensor,
+            bits=bits,
+            dir=-1,
+            asym=True,
+            iter=DEFAULT_DYNAMIC_QUANT_ITER,
+            qw=imatrix,
+        )
     else:
         scale, zp = search_scales_zp(tensor, bits, qw=imatrix)
         scale = torch.where(scale < 0, torch.clamp(scale, max=-q_scale_thresh), torch.clamp(scale, min=q_scale_thresh))
