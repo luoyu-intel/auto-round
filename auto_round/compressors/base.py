@@ -1362,7 +1362,7 @@ class BaseCompressor(object):
             )
             if has_gguf_k:
                 enable_imatrix = True
-            elif self.data_type == "int" and self.sym:
+            elif self.data_type == "int":
                 enable_imatrix = True
         if enable_imatrix:
             self._quant_rtn_with_imatrix(all_to_quantized_module_names)
