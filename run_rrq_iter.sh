@@ -9,9 +9,9 @@ OUTPUT_ROOT="${2:-}"
 SCHEME="${3:-W2A16G64}"
 DEFAULT_SUFFIX="${SCHEME,,}"
 DEFAULT_SUFFIX="${DEFAULT_SUFFIX//a16/}"
-SUFFIX="${4:-$DEFAULT_SUFFIX}"
-ITERATION_COUNT="${5:-3}"
-USE_LOW_GPU_MEM_USAGE="${6:-false}"
+SUFFIX="$DEFAULT_SUFFIX"
+ITERATION_COUNT="${4:-3}"
+USE_LOW_GPU_MEM_USAGE="${5:-false}"
 echo "MODEL_PATH: $MODEL_PATH"
 echo "OUTPUT_ROOT: $OUTPUT_ROOT"  
 echo "SCHEME: $SCHEME"
@@ -20,7 +20,7 @@ echo "ITERATION_COUNT: $ITERATION_COUNT"
 echo "USE_LOW_GPU_MEM_USAGE: $USE_LOW_GPU_MEM_USAGE"
 
 if [[ -z "$MODEL_PATH" || -z "$OUTPUT_ROOT" ]]; then
-	echo "Usage: $0 <model_path_or_model_card> <output_root_dir> [scheme] [suffix] [iteration_count] [use_low_gpu_mem_usage]"
+	echo "Usage: $0 <model_path_or_model_card> <output_root_dir> [scheme] [iteration_count] [use_low_gpu_mem_usage]"
 	exit 1
 fi
 
