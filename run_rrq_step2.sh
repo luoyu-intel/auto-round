@@ -32,7 +32,7 @@ OUTPUT_R0_OUTPUT_MERGE_DIR="${OUTPUT_ROOT%/}/${MODEL_NAME}-${SCHEME}-R0-${SCHEME
 python get_residual.py -i "$MODEL_PATH" -q "$BASE_OUTPUT_DIR" -o "${OUTPUT_R0_DIR}" --operation sub --device cpu
 
 export AUTO_ROUND_LOAD_IMATRIX_FILE="$IMATRIX_FILE"
-python -m auto_round --model "$OUTPUT_R0_DIR" --scheme "$SCHEME" --format "fake" --iters 0 --output_dir "$OUTPUT_R0_OUTPUT_DIR" --asym --low_gpu_mem_usage
+python -m auto_round --model "$OUTPUT_R0_DIR" --scheme "$SCHEME" --format "fake" --iters 0 --output_dir "$OUTPUT_R0_OUTPUT_DIR"
 unset AUTO_ROUND_LOAD_IMATRIX_FILE
 R0_OUTPUT_DIR="${OUTPUT_R0_OUTPUT_DIR}/${MODEL_NAME}-${SCHEME}-R0-${SUFFIX}"
 
@@ -43,4 +43,4 @@ echo "Imatrix file is loaded from ${IMATRIX_FILE}"
 echo "R0 quantization results are saved in ${OUTPUT_R0_OUTPUT_DIR}"
 echo "R0 merged quantization results are saved in ${OUTPUT_R0_OUTPUT_MERGE_DIR}"
 
-lm_eval --model hf --model_args pretrained=${OUTPUT_R0_OUTPUT_MERGE_DIR} --tasks piqa,mmlu,lambada,winogrande,hellaswag,arc_easy,arc_challenge --device cuda --batch_size 16
+lm_eval --model hf --model_args pretrained=${OUTPUT_R0_OUTPUT_MERGE_DIR} --tasks piqa,boolq,winogrande,hellaswag,arc_easy,arc_challenge --device cuda --batch_size 16
