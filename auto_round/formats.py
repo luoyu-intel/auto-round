@@ -57,6 +57,16 @@ from auto_round.utils import (
 )
 
 
+def _normalize_tied_weight_keys_for_save(model: torch.nn.Module) -> None:
+    for submodule in model.modules():
+        tied_weight_keys = getattr(submodule, "_tied_weights_keys", None)
+        if isinstance(tied_weight_keys, dict) or tied_weight_keys is None:
+            continue
+        if isinstance(tied_weight_keys, (list, tuple, set)):
+            normalized = {key: key for key in tied_weight_keys if isinstance(key, str)}
+            submodule._tied_weights_keys = normalized
+
+
 class AutoRoundExportFormat(str, Enum):
     # Weight: FP8, per-channel, may be extended to per-tensor in future
     # Activation: FP8, per-tensor
@@ -332,6 +342,7 @@ class FakeFormat(OutputFormat):
     ):
         if not unsupported_meta_device(model):
             model = model.to("cpu")
+            _normalize_tied_weight_keys_for_save(model)
             model.save_pretrained(output_dir)
         elif hasattr(model, "config") and model.config is not None:
             model.config.save_pretrained(output_dir)
