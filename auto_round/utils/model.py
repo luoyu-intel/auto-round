@@ -39,6 +39,17 @@ from auto_round.utils.weight_handler import (
 FIX_MISTRAL_REGEX_MODEL_TYPE_LIST = ["longcat_next"]
 
 
+def normalize_tied_weight_keys_for_save(model: torch.nn.Module) -> None:
+    if model is None:
+        return
+    for submodule in model.modules():
+        tied_weight_keys = getattr(submodule, "_tied_weights_keys", None)
+        if isinstance(tied_weight_keys, dict) or tied_weight_keys is None:
+            continue
+        if isinstance(tied_weight_keys, (list, tuple, set)):
+            submodule._tied_weights_keys = {key: key for key in tied_weight_keys if isinstance(key, str)}
+
+
 def clean_module_parameter(submodule: torch.nn.Module, param_name: str) -> None:
     """This function is recommended to be used instead of module.weight = None.
     For models like `tie_word_embeddings`, setting the embedding weight to None

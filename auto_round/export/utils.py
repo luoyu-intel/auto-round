@@ -22,6 +22,7 @@ from auto_round.utils import (
     copy_missing_tensors_from_source,
     copy_python_files_from_model_cache,
     logger,
+    normalize_tied_weight_keys_for_save,
     unsupported_meta_device,
 )
 
@@ -190,6 +191,7 @@ def save_model(
         if hasattr(model, "generation_config") and model.generation_config is not None:
             model.generation_config.save_pretrained(save_dir)
     else:
+        normalize_tied_weight_keys_for_save(model)
         model.save_pretrained(save_dir, max_shard_size=max_shard_size, safe_serialization=safe_serialization)
 
     # Allow disabling copy_missing_tensors_from_source via env var AR_DISABLE_COPY_MTP_WEIGHTS, default enabled

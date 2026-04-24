@@ -7,6 +7,8 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from auto_round.utils import normalize_tied_weight_keys_for_save
+
 
 def get_option_parser():
 	parser = argparse.ArgumentParser(prog="get_residual")
@@ -170,6 +172,7 @@ def run(args):
 		print(f"load_state_dict missing_keys={load_result.missing_keys}")
 		print(f"load_state_dict unexpected_keys={load_result.unexpected_keys}")
 
+	normalize_tied_weight_keys_for_save(original_model)
 	original_model.save_pretrained(output_dir, safe_serialization=True)
 	try_save_tokenizer(original_source, output_dir)
 	save_report(output_dir, report, original_source, quantized_source, operation)
