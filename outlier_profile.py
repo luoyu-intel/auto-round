@@ -57,7 +57,7 @@ def get_option_parser() -> argparse.ArgumentParser:
 		"--ratio-threshold",
 		type=float,
 		default=None,
-		help="Optional threshold used to count tensors whose max_ratio is above, below, or equal to it",
+		help="Optional threshold used for max_ratio summaries and as a reference line on the paper-style K/r plots",
 	)
 	parser.add_argument(
 		"--kr-percentile",
@@ -185,12 +185,32 @@ def compute_linear_quantile(values: torch.Tensor, quantile: float) -> float:
 	return float(torch.lerp(lower_value, upper_value, weight).item())
 
 
+def compute_linear_quantile_along_last_dim(values: torch.Tensor, quantile: float) -> torch.Tensor:
+	count = values.shape[-1]
+	if count == 0:
+		raise ValueError("quantile input tensor is empty")
+	if count == 1:
+		return values[..., 0]
+
+	sorted_values, _ = torch.sort(values, dim=-1)
+	position = (count - 1) * quantile
+	lower_index = int(math.floor(position))
+	upper_index = int(math.ceil(position))
+	lower_value = sorted_values[..., lower_index]
+	if lower_index == upper_index:
+		return lower_value
+	upper_value = sorted_values[..., upper_index]
+	weight = position - lower_index
+	return lower_value + (upper_value - lower_value) * weight
+
+
 def compute_group_ratio_stats(
 	tensor: torch.Tensor,
 	group_size: int,
 	device: str,
 	topk: int,
 	kr_percentile: float,
+	ratio_threshold: float | None,
 ) -> dict[str, Any]:
 	if tensor.ndim == 0:
 		raise ValueError("scalar tensor is not supported")
@@ -231,6 +251,17 @@ def compute_group_ratio_stats(
 	else:
 		paper_kr_ratio = math.inf
 
+	group_max_abs = abs_values.max(dim=-1).values
+	group_inlier_radius = compute_linear_quantile_along_last_dim(abs_values, kr_percentile)
+	group_paper_kr_ratios = torch.full_like(group_max_abs, fill_value=torch.inf)
+	positive_group_radius_mask = group_inlier_radius > 0
+	group_paper_kr_ratios[positive_group_radius_mask] = (
+		group_max_abs[positive_group_radius_mask] / group_inlier_radius[positive_group_radius_mask]
+	)
+	zero_group_mask = (~positive_group_radius_mask) & (group_max_abs == 0)
+	group_paper_kr_ratios[zero_group_mask] = 1.0
+	flat_group_paper_kr_ratios = group_paper_kr_ratios.reshape(-1)
+
 	max_ratio_value, max_ratio_position = flat_ratios.max(dim=0)
 	group_index = int(max_ratio_position.item())
 	groups_per_row = reshaped.shape[1]
@@ -258,6 +289,33 @@ def compute_group_ratio_stats(
 		finite_p95 = math.nan
 		finite_p99 = math.nan
 
+	group_threshold_summary = None
+	group_paper_kr_threshold_summary = None
+	if ratio_threshold is not None:
+		greater_count = int((flat_ratios > ratio_threshold).sum().item())
+		less_count = int((flat_ratios < ratio_threshold).sum().item())
+		equal_count = int((flat_ratios == ratio_threshold).sum().item())
+		total_count = int(flat_ratios.numel())
+		group_threshold_summary = {
+			"threshold": ratio_threshold,
+			"total_group_count": total_count,
+			"greater_than_count": greater_count,
+			"greater_than_percentage": greater_count / total_count if total_count else math.nan,
+			"less_than_count": less_count,
+			"equal_count": equal_count,
+		}
+		group_paper_kr_greater_count = int((flat_group_paper_kr_ratios > ratio_threshold).sum().item())
+		group_paper_kr_less_count = int((flat_group_paper_kr_ratios < ratio_threshold).sum().item())
+		group_paper_kr_equal_count = int((flat_group_paper_kr_ratios == ratio_threshold).sum().item())
+		group_paper_kr_threshold_summary = {
+			"threshold": ratio_threshold,
+			"total_group_count": total_count,
+			"greater_than_count": group_paper_kr_greater_count,
+			"greater_than_percentage": group_paper_kr_greater_count / total_count if total_count else math.nan,
+			"less_than_count": group_paper_kr_less_count,
+			"equal_count": group_paper_kr_equal_count,
+		}
+
 	return {
 		"shape": list(tensor.shape),
 		"dtype": str(tensor.dtype),
@@ -274,6 +332,8 @@ def compute_group_ratio_stats(
 		"p99_ratio": finite_p99,
 		"finite_group_count": finite_count,
 		"infinite_group_count": inf_count,
+		"group_threshold_summary": group_threshold_summary,
+		"group_paper_kr_threshold_summary": group_paper_kr_threshold_summary,
 		"max_ratio_group": {
 			"flat_index": group_index,
 			"row_index": row_index,
@@ -311,15 +371,79 @@ def build_summary(
 	ratios = [record["max_ratio"] for record in sorted_records if math.isfinite(record["max_ratio"])]
 	paper_kr_ratios = [record["paper_kr_ratio"] for record in sorted_records if math.isfinite(record["paper_kr_ratio"])]
 	threshold_summary = None
+	paper_kr_threshold_summary = None
 	if ratio_threshold is not None:
-		greater_count = sum(1 for record in sorted_records if record["paper_kr_ratio"] > ratio_threshold)
-		less_count = sum(1 for record in sorted_records if record["paper_kr_ratio"] < ratio_threshold)
-		equal_count = sum(1 for record in sorted_records if record["paper_kr_ratio"] == ratio_threshold)
+		tensor_count = len(sorted_records)
+		max_ratio_tensor_greater_count = sum(1 for record in sorted_records if record["max_ratio"] > ratio_threshold)
+		max_ratio_tensor_less_count = sum(1 for record in sorted_records if record["max_ratio"] < ratio_threshold)
+		max_ratio_tensor_equal_count = sum(1 for record in sorted_records if record["max_ratio"] == ratio_threshold)
+		total_group_count = sum(record["num_groups"] for record in sorted_records)
+		group_greater_count = sum(
+			record["group_threshold_summary"]["greater_than_count"]
+			for record in sorted_records
+			if record["group_threshold_summary"] is not None
+		)
+		group_less_count = sum(
+			record["group_threshold_summary"]["less_than_count"]
+			for record in sorted_records
+			if record["group_threshold_summary"] is not None
+		)
+		group_equal_count = sum(
+			record["group_threshold_summary"]["equal_count"]
+			for record in sorted_records
+			if record["group_threshold_summary"] is not None
+		)
+		group_paper_kr_greater_count = sum(
+			record["group_paper_kr_threshold_summary"]["greater_than_count"]
+			for record in sorted_records
+			if record["group_paper_kr_threshold_summary"] is not None
+		)
+		group_paper_kr_less_count = sum(
+			record["group_paper_kr_threshold_summary"]["less_than_count"]
+			for record in sorted_records
+			if record["group_paper_kr_threshold_summary"] is not None
+		)
+		group_paper_kr_equal_count = sum(
+			record["group_paper_kr_threshold_summary"]["equal_count"]
+			for record in sorted_records
+			if record["group_paper_kr_threshold_summary"] is not None
+		)
+		paper_kr_tensor_greater_count = sum(1 for record in sorted_records if record["paper_kr_ratio"] > ratio_threshold)
+		paper_kr_tensor_less_count = sum(1 for record in sorted_records if record["paper_kr_ratio"] < ratio_threshold)
+		paper_kr_tensor_equal_count = sum(1 for record in sorted_records if record["paper_kr_ratio"] == ratio_threshold)
 		threshold_summary = {
 			"threshold": ratio_threshold,
-			"greater_than_count": greater_count,
-			"less_than_count": less_count,
-			"equal_count": equal_count,
+			"tensor_count": {
+				"total": tensor_count,
+				"greater_than_count": max_ratio_tensor_greater_count,
+				"greater_than_percentage": max_ratio_tensor_greater_count / tensor_count if tensor_count else math.nan,
+				"less_than_count": max_ratio_tensor_less_count,
+				"equal_count": max_ratio_tensor_equal_count,
+			},
+			"group_count": {
+				"total": total_group_count,
+				"greater_than_count": group_greater_count,
+				"greater_than_percentage": group_greater_count / total_group_count if total_group_count else math.nan,
+				"less_than_count": group_less_count,
+				"equal_count": group_equal_count,
+			},
+		}
+		paper_kr_threshold_summary = {
+			"threshold": ratio_threshold,
+			"tensor_count": {
+				"total": tensor_count,
+				"greater_than_count": paper_kr_tensor_greater_count,
+				"greater_than_percentage": paper_kr_tensor_greater_count / tensor_count if tensor_count else math.nan,
+				"less_than_count": paper_kr_tensor_less_count,
+				"equal_count": paper_kr_tensor_equal_count,
+			},
+			"group_count": {
+				"total": total_group_count,
+				"greater_than_count": group_paper_kr_greater_count,
+				"greater_than_percentage": group_paper_kr_greater_count / total_group_count if total_group_count else math.nan,
+				"less_than_count": group_paper_kr_less_count,
+				"equal_count": group_paper_kr_equal_count,
+			},
 		}
 	return {
 		"model_dir": model_dir,
@@ -334,6 +458,7 @@ def build_summary(
 		"global_max_paper_kr_ratio": max(paper_kr_ratios) if paper_kr_ratios else math.nan,
 		"global_mean_paper_kr_ratio": sum(paper_kr_ratios) / len(paper_kr_ratios) if paper_kr_ratios else math.nan,
 		"ratio_threshold_summary": threshold_summary,
+		"paper_kr_threshold_summary": paper_kr_threshold_summary,
 		"top_tensors": sorted_records[:topk],
 		"skipped": skipped,
 	}
@@ -722,7 +847,14 @@ def profile_model(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[s
 			continue
 
 		try:
-			stats = compute_group_ratio_stats(tensor, args.group_size, args.device, args.topk, args.kr_percentile)
+			stats = compute_group_ratio_stats(
+				tensor,
+				args.group_size,
+				args.device,
+				args.topk,
+				args.kr_percentile,
+				args.ratio_threshold,
+			)
 		except ValueError as exc:
 			skipped.append(
 				{
@@ -807,10 +939,33 @@ def run(args: argparse.Namespace) -> None:
 	if summary["ratio_threshold_summary"] is not None:
 		threshold_summary = summary["ratio_threshold_summary"]
 		print(
-			"Threshold summary: "
-			f"> {threshold_summary['threshold']}: {threshold_summary['greater_than_count']}, "
-			f"< {threshold_summary['threshold']}: {threshold_summary['less_than_count']}, "
-			f"= {threshold_summary['threshold']}: {threshold_summary['equal_count']}"
+			"Threshold summary (tensor max_ratio): "
+			f"> {threshold_summary['threshold']}: {threshold_summary['tensor_count']['greater_than_count']} "
+			f"({format_metric(threshold_summary['tensor_count']['greater_than_percentage'] * 100)}%), "
+			f"< {threshold_summary['threshold']}: {threshold_summary['tensor_count']['less_than_count']}, "
+			f"= {threshold_summary['threshold']}: {threshold_summary['tensor_count']['equal_count']}"
+		)
+		print(
+			"Threshold summary (group max_ratio): "
+			f"> {threshold_summary['threshold']}: {threshold_summary['group_count']['greater_than_count']} "
+			f"({format_metric(threshold_summary['group_count']['greater_than_percentage'] * 100)}%), "
+			f"< {threshold_summary['threshold']}: {threshold_summary['group_count']['less_than_count']}, "
+			f"= {threshold_summary['threshold']}: {threshold_summary['group_count']['equal_count']}"
+		)
+		paper_kr_threshold_summary = summary["paper_kr_threshold_summary"]
+		print(
+			"Threshold summary (tensor paper K/r): "
+			f"> {paper_kr_threshold_summary['threshold']}: {paper_kr_threshold_summary['tensor_count']['greater_than_count']} "
+			f"({format_metric(paper_kr_threshold_summary['tensor_count']['greater_than_percentage'] * 100)}%), "
+			f"< {paper_kr_threshold_summary['threshold']}: {paper_kr_threshold_summary['tensor_count']['less_than_count']}, "
+			f"= {paper_kr_threshold_summary['threshold']}: {paper_kr_threshold_summary['tensor_count']['equal_count']}"
+		)
+		print(
+			"Threshold summary (group paper K/r): "
+			f"> {paper_kr_threshold_summary['threshold']}: {paper_kr_threshold_summary['group_count']['greater_than_count']} "
+			f"({format_metric(paper_kr_threshold_summary['group_count']['greater_than_percentage'] * 100)}%), "
+			f"< {paper_kr_threshold_summary['threshold']}: {paper_kr_threshold_summary['group_count']['less_than_count']}, "
+			f"= {paper_kr_threshold_summary['threshold']}: {paper_kr_threshold_summary['group_count']['equal_count']}"
 		)
 
 
