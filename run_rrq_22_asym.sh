@@ -46,4 +46,4 @@ echo "Base quantization results are saved in ${OUTPUT_DIR}"
 echo "R0 quantization results are saved in ${OUTPUT_R0_OUTPUT_DIR}"
 echo "R0 merged quantization results are saved in ${OUTPUT_R0_OUTPUT_MERGE_DIR}"
 
-lm_eval --model hf --model_args pretrained=${OUTPUT_R0_OUTPUT_MERGE_DIR} --tasks piqa,mmlu,lambada,winogrande,hellaswag,arc_easy,arc_challenge --device cuda --batch_size 16
+# lm_eval --model hf --model_args pretrained=${OUTPUT_R0_OUTPUT_MERGE_DIR} --tasks piqa,mmlu,lambada,winogrande,hellaswag,arc_easy,arc_challenge --device cuda --batch_size 16
