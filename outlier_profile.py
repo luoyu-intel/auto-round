@@ -204,6 +204,60 @@ def compute_linear_quantile_along_last_dim(values: torch.Tensor, quantile: float
 	return lower_value + (upper_value - lower_value) * weight
 
 
+def compute_lower_quantile_along_last_dim(values: torch.Tensor, quantile: float) -> torch.Tensor:
+	count = values.shape[-1]
+	if count == 0:
+		raise ValueError("quantile input tensor is empty")
+	if count == 1:
+		return values[..., 0]
+
+	sorted_values, _ = torch.sort(values, dim=-1)
+	index = int(math.floor((count - 1) * quantile))
+	return sorted_values[..., index]
+
+
+def compute_signed_group_anchor_along_last_dim(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+	if values.shape[-1] == 0:
+		raise ValueError("anchor input tensor is empty")
+
+	max_values = values.max(dim=-1).values
+	min_values = values.min(dim=-1).values
+	positive_mask = values > 0
+	negative_mask = values < 0
+	positive_count = positive_mask.sum(dim=-1)
+	negative_count = negative_mask.sum(dim=-1)
+
+	positive_values = torch.where(positive_mask, values, torch.full_like(values, -torch.inf))
+	top_positive_values = torch.topk(positive_values, k=min(2, values.shape[-1]), dim=-1).values
+	if values.shape[-1] >= 2:
+		second_largest_positive = top_positive_values[..., 1]
+	else:
+		second_largest_positive = torch.full_like(max_values, -torch.inf)
+
+	negative_abs_values = torch.where(negative_mask, -values, torch.full_like(values, -torch.inf))
+	top_negative_abs_values = torch.topk(negative_abs_values, k=min(2, values.shape[-1]), dim=-1).values
+	if values.shape[-1] >= 2:
+		second_smallest_negative = -top_negative_abs_values[..., 1]
+	else:
+		second_smallest_negative = torch.full_like(min_values, torch.inf)
+
+	# K is the signed endpoint with the largest magnitude in the group.
+	k_is_positive = max_values.abs() >= min_values.abs()
+	k_values = torch.where(k_is_positive, max_values, min_values)
+	r_values = torch.zeros_like(k_values)
+
+	positive_k_with_negative = k_is_positive & (negative_count > 0)
+	positive_k_with_second_positive = k_is_positive & (negative_count == 0) & (positive_count > 1)
+	negative_k_with_positive = (~k_is_positive) & (positive_count > 0)
+	negative_k_with_second_negative = (~k_is_positive) & (positive_count == 0) & (negative_count > 1)
+
+	r_values = torch.where(positive_k_with_negative, min_values, r_values)
+	r_values = torch.where(positive_k_with_second_positive, second_largest_positive / 2, r_values)
+	r_values = torch.where(negative_k_with_positive, max_values, r_values)
+	r_values = torch.where(negative_k_with_second_negative, second_smallest_negative / 2, r_values)
+	return k_values, r_values
+
+
 def compute_group_ratio_stats(
 	tensor: torch.Tensor,
 	group_size: int,
@@ -228,10 +282,17 @@ def compute_group_ratio_stats(
 	work_tensor = work_tensor.to(device=device, dtype=torch.float32)
 	reshaped = work_tensor.reshape(-1, work_tensor.shape[-1] // group_size, group_size)
 	abs_values = reshaped.abs()
-	top2_values, top2_indices = torch.topk(abs_values, k=2, dim=-1)
+	topk_value_count = min(3, group_size)
+	topk_values, topk_indices = torch.topk(abs_values, k=topk_value_count, dim=-1)
+	top2_values = topk_values[..., :2]
+	top2_indices = topk_indices[..., :2]
 
 	largest = top2_values[..., 0]
 	second_largest = top2_values[..., 1]
+	if topk_value_count >= 3:
+		third_largest = topk_values[..., 2]
+	else:
+		third_largest = second_largest
 	ratios = torch.full_like(largest, fill_value=torch.inf)
 	nonzero_mask = second_largest > 0
 	ratios[nonzero_mask] = largest[nonzero_mask] / second_largest[nonzero_mask]
@@ -241,26 +302,41 @@ def compute_group_ratio_stats(
 	flat_ratios = ratios.reshape(-1)
 	finite_mask = torch.isfinite(flat_ratios)
 	finite_ratios = flat_ratios[finite_mask]
+	ratio_finite_count = int(finite_mask.sum().item())
+	ratio_infinite_count = int((~finite_mask).sum().item())
+	ratio_finite_sum = float(finite_ratios.sum().item()) if ratio_finite_count > 0 else 0.0
+	# Mean statistics describe the average severity across all groups in a tensor.
+	mean_group_max_ratio = float(flat_ratios.mean().item())
+	# Any-group statistics reproduce the older "one bad group is enough" behavior.
+	any_group_max_ratio = float(flat_ratios.max().item())
 	flat_abs_values = abs_values.reshape(-1)
-	max_abs = float(flat_abs_values.max().item())
-	inlier_radius = compute_linear_quantile(flat_abs_values, kr_percentile)
-	if inlier_radius > 0:
-		paper_kr_ratio = max_abs / inlier_radius
-	elif max_abs == 0:
-		paper_kr_ratio = 1.0
+	whole_tensor_max_abs = float(flat_abs_values.max().item())
+	whole_tensor_inlier_radius = compute_linear_quantile(flat_abs_values, kr_percentile)
+	if whole_tensor_inlier_radius > 0:
+		whole_tensor_paper_kr_ratio = whole_tensor_max_abs / whole_tensor_inlier_radius
+	elif whole_tensor_max_abs == 0:
+		whole_tensor_paper_kr_ratio = 1.0
 	else:
-		paper_kr_ratio = math.inf
+		whole_tensor_paper_kr_ratio = math.inf
 
-	group_max_abs = abs_values.max(dim=-1).values
-	group_inlier_radius = compute_linear_quantile_along_last_dim(abs_values, kr_percentile)
+	group_k_values, group_inlier_radius = compute_signed_group_anchor_along_last_dim(reshaped)
+	group_max_abs = group_k_values.abs()
+	group_inlier_radius_abs = group_inlier_radius.abs()
 	group_paper_kr_ratios = torch.full_like(group_max_abs, fill_value=torch.inf)
-	positive_group_radius_mask = group_inlier_radius > 0
-	group_paper_kr_ratios[positive_group_radius_mask] = (
-		group_max_abs[positive_group_radius_mask] / group_inlier_radius[positive_group_radius_mask]
+	nonzero_group_radius_mask = group_inlier_radius_abs > 0
+	group_paper_kr_ratios[nonzero_group_radius_mask] = (
+		group_max_abs[nonzero_group_radius_mask] / group_inlier_radius_abs[nonzero_group_radius_mask]
 	)
-	zero_group_mask = (~positive_group_radius_mask) & (group_max_abs == 0)
+	zero_group_mask = (~nonzero_group_radius_mask) & (group_max_abs == 0)
 	group_paper_kr_ratios[zero_group_mask] = 1.0
 	flat_group_paper_kr_ratios = group_paper_kr_ratios.reshape(-1)
+	group_paper_kr_finite_mask = torch.isfinite(flat_group_paper_kr_ratios)
+	finite_group_paper_kr_ratios = flat_group_paper_kr_ratios[group_paper_kr_finite_mask]
+	group_paper_kr_finite_count = int(group_paper_kr_finite_mask.sum().item())
+	group_paper_kr_infinite_count = int((~group_paper_kr_finite_mask).sum().item())
+	group_paper_kr_finite_sum = float(finite_group_paper_kr_ratios.sum().item()) if group_paper_kr_finite_count > 0 else 0.0
+	mean_group_paper_kr_ratio = float(flat_group_paper_kr_ratios.mean().item())
+	any_group_paper_kr_ratio = float(flat_group_paper_kr_ratios.max().item())
 
 	max_ratio_value, max_ratio_position = flat_ratios.max(dim=0)
 	group_index = int(max_ratio_position.item())
@@ -270,13 +346,13 @@ def compute_group_ratio_stats(
 	group_slice = reshaped[row_index, inner_group_index]
 	top_values = top2_values.reshape(-1, 2)[group_index]
 	top_indices = top2_indices.reshape(-1, 2)[group_index]
+	group_topk_values = topk_values.reshape(-1, topk_value_count)[group_index]
+	group_topk_indices = topk_indices.reshape(-1, topk_value_count)[group_index]
 
 	top_groups_count = min(topk, flat_ratios.numel())
 	top_group_ratios, top_group_positions = torch.topk(flat_ratios, k=top_groups_count)
 
-	finite_count = int(finite_mask.sum().item())
-	inf_count = int((~finite_mask).sum().item())
-	if finite_count > 0:
+	if ratio_finite_count > 0:
 		finite_mean = float(finite_ratios.mean().item())
 		finite_median = float(finite_ratios.median().item())
 		finite_std = float(finite_ratios.std(unbiased=False).item())
@@ -320,18 +396,34 @@ def compute_group_ratio_stats(
 		"shape": list(tensor.shape),
 		"dtype": str(tensor.dtype),
 		"num_groups": int(flat_ratios.numel()),
-		"max_ratio": float(max_ratio_value.item()),
-		"paper_kr_ratio": float(paper_kr_ratio),
-		"paper_kr_max_abs": max_abs,
-		"paper_kr_inlier_radius": inlier_radius,
+		"mean_group_max_ratio": mean_group_max_ratio,
+		"any_group_max_ratio": any_group_max_ratio,
+		"max_ratio_group_finite_sum": ratio_finite_sum,
+		"max_ratio_group_finite_count": ratio_finite_count,
+		"max_ratio_group_infinite_count": ratio_infinite_count,
+		"mean_group_paper_kr_ratio": mean_group_paper_kr_ratio,
+		"any_group_paper_kr_ratio": any_group_paper_kr_ratio,
+		"whole_tensor_paper_kr_ratio": float(whole_tensor_paper_kr_ratio),
+		"whole_tensor_paper_kr_max_abs": whole_tensor_max_abs,
+		"whole_tensor_paper_kr_inlier_radius": whole_tensor_inlier_radius,
+		# Backward-compatible aliases for earlier JSON consumers.
+		"max_ratio": mean_group_max_ratio,
+		"max_group_ratio": any_group_max_ratio,
+		"paper_kr_ratio": mean_group_paper_kr_ratio,
+		"paper_kr_max_group_ratio": any_group_paper_kr_ratio,
+		"legacy_tensor_paper_kr_ratio": float(whole_tensor_paper_kr_ratio),
+		"paper_kr_group_finite_sum": group_paper_kr_finite_sum,
+		"paper_kr_group_finite_count": group_paper_kr_finite_count,
+		"paper_kr_group_infinite_count": group_paper_kr_infinite_count,
 		"paper_kr_percentile": kr_percentile,
+		"group_paper_kr_rule": "signed_endpoint",
 		"mean_ratio": finite_mean,
 		"median_ratio": finite_median,
 		"std_ratio": finite_std,
 		"p95_ratio": finite_p95,
 		"p99_ratio": finite_p99,
-		"finite_group_count": finite_count,
-		"infinite_group_count": inf_count,
+		"finite_group_count": ratio_finite_count,
+		"infinite_group_count": ratio_infinite_count,
 		"group_threshold_summary": group_threshold_summary,
 		"group_paper_kr_threshold_summary": group_paper_kr_threshold_summary,
 		"max_ratio_group": {
@@ -340,8 +432,10 @@ def compute_group_ratio_stats(
 			"group_index": inner_group_index,
 			"largest_abs": float(top_values[0].item()),
 			"second_abs": float(top_values[1].item()),
+			"third_abs": float(group_topk_values[2].item()) if topk_value_count >= 3 else float(top_values[1].item()),
 			"largest_abs_index": int(top_indices[0].item()),
 			"second_abs_index": int(top_indices[1].item()),
+			"third_abs_index": int(group_topk_indices[2].item()) if topk_value_count >= 3 else int(top_indices[1].item()),
 			"values": [float(value.item()) for value in group_slice.detach().cpu()],
 		},
 		"top_groups": [
@@ -367,16 +461,40 @@ def build_summary(
 	ratio_threshold: float | None,
 	skipped: list[dict[str, Any]],
 ) -> dict[str, Any]:
-	sorted_records = sorted(tensor_records, key=lambda item: item["max_ratio"], reverse=True)
-	ratios = [record["max_ratio"] for record in sorted_records if math.isfinite(record["max_ratio"])]
-	paper_kr_ratios = [record["paper_kr_ratio"] for record in sorted_records if math.isfinite(record["paper_kr_ratio"])]
+	sorted_records = sorted(tensor_records, key=lambda item: item["mean_group_max_ratio"], reverse=True)
+	any_group_sorted_records = sorted(tensor_records, key=lambda item: item["any_group_max_ratio"], reverse=True)
+	tensor_max_ratios = [record["mean_group_max_ratio"] for record in sorted_records if math.isfinite(record["mean_group_max_ratio"])]
+	tensor_paper_kr_ratios = [record["mean_group_paper_kr_ratio"] for record in sorted_records if math.isfinite(record["mean_group_paper_kr_ratio"])]
+	tensor_any_group_max_ratios = [record["any_group_max_ratio"] for record in sorted_records if math.isfinite(record["any_group_max_ratio"])]
+	tensor_any_group_paper_kr_ratios = [record["any_group_paper_kr_ratio"] for record in sorted_records if math.isfinite(record["any_group_paper_kr_ratio"])]
+	tensor_whole_tensor_paper_kr_ratios = [
+		record["whole_tensor_paper_kr_ratio"] for record in sorted_records if math.isfinite(record["whole_tensor_paper_kr_ratio"])
+	]
+	global_group_ratio_finite_count = sum(record["max_ratio_group_finite_count"] for record in sorted_records)
+	global_group_ratio_infinite_count = sum(record["max_ratio_group_infinite_count"] for record in sorted_records)
+	global_group_ratio_finite_sum = sum(record["max_ratio_group_finite_sum"] for record in sorted_records)
+	global_max_group_ratio = max((record["max_group_ratio"] for record in sorted_records), default=math.nan)
+	if global_group_ratio_infinite_count > 0:
+		global_group_mean_ratio = math.inf
+	elif global_group_ratio_finite_count > 0:
+		global_group_mean_ratio = global_group_ratio_finite_sum / global_group_ratio_finite_count
+	else:
+		global_group_mean_ratio = math.nan
+	global_group_paper_kr_finite_count = sum(record["paper_kr_group_finite_count"] for record in sorted_records)
+	global_group_paper_kr_infinite_count = sum(record["paper_kr_group_infinite_count"] for record in sorted_records)
+	global_group_paper_kr_finite_sum = sum(record["paper_kr_group_finite_sum"] for record in sorted_records)
+	global_group_paper_kr_max_ratio = max((record["paper_kr_max_group_ratio"] for record in sorted_records), default=math.nan)
+	if global_group_paper_kr_infinite_count > 0:
+		global_group_paper_kr_mean_ratio = math.inf
+	elif global_group_paper_kr_finite_count > 0:
+		global_group_paper_kr_mean_ratio = global_group_paper_kr_finite_sum / global_group_paper_kr_finite_count
+	else:
+		global_group_paper_kr_mean_ratio = math.nan
 	threshold_summary = None
 	paper_kr_threshold_summary = None
+	whole_tensor_paper_kr_threshold_summary = None
 	if ratio_threshold is not None:
 		tensor_count = len(sorted_records)
-		max_ratio_tensor_greater_count = sum(1 for record in sorted_records if record["max_ratio"] > ratio_threshold)
-		max_ratio_tensor_less_count = sum(1 for record in sorted_records if record["max_ratio"] < ratio_threshold)
-		max_ratio_tensor_equal_count = sum(1 for record in sorted_records if record["max_ratio"] == ratio_threshold)
 		total_group_count = sum(record["num_groups"] for record in sorted_records)
 		group_greater_count = sum(
 			record["group_threshold_summary"]["greater_than_count"]
@@ -408,9 +526,41 @@ def build_summary(
 			for record in sorted_records
 			if record["group_paper_kr_threshold_summary"] is not None
 		)
-		paper_kr_tensor_greater_count = sum(1 for record in sorted_records if record["paper_kr_ratio"] > ratio_threshold)
-		paper_kr_tensor_less_count = sum(1 for record in sorted_records if record["paper_kr_ratio"] < ratio_threshold)
-		paper_kr_tensor_equal_count = sum(1 for record in sorted_records if record["paper_kr_ratio"] == ratio_threshold)
+		max_ratio_tensor_greater_count = sum(
+			1
+			for record in sorted_records
+			if record["group_threshold_summary"] is not None and record["group_threshold_summary"]["greater_than_count"] > 0
+		)
+		max_ratio_tensor_equal_count = sum(
+			1
+			for record in sorted_records
+			if record["group_threshold_summary"] is not None
+			and record["group_threshold_summary"]["greater_than_count"] == 0
+			and record["group_threshold_summary"]["equal_count"] > 0
+		)
+		max_ratio_tensor_less_count = tensor_count - max_ratio_tensor_greater_count - max_ratio_tensor_equal_count
+		paper_kr_tensor_greater_count = sum(
+			1
+			for record in sorted_records
+			if record["group_paper_kr_threshold_summary"] is not None and record["group_paper_kr_threshold_summary"]["greater_than_count"] > 0
+		)
+		paper_kr_tensor_equal_count = sum(
+			1
+			for record in sorted_records
+			if record["group_paper_kr_threshold_summary"] is not None
+			and record["group_paper_kr_threshold_summary"]["greater_than_count"] == 0
+			and record["group_paper_kr_threshold_summary"]["equal_count"] > 0
+		)
+		paper_kr_tensor_less_count = tensor_count - paper_kr_tensor_greater_count - paper_kr_tensor_equal_count
+		whole_tensor_paper_kr_greater_count = sum(
+			1 for record in sorted_records if record["whole_tensor_paper_kr_ratio"] > ratio_threshold
+		)
+		whole_tensor_paper_kr_less_count = sum(
+			1 for record in sorted_records if record["whole_tensor_paper_kr_ratio"] < ratio_threshold
+		)
+		whole_tensor_paper_kr_equal_count = sum(
+			1 for record in sorted_records if record["whole_tensor_paper_kr_ratio"] == ratio_threshold
+		)
 		threshold_summary = {
 			"threshold": ratio_threshold,
 			"tensor_count": {
@@ -445,21 +595,96 @@ def build_summary(
 				"equal_count": group_paper_kr_equal_count,
 			},
 		}
+		whole_tensor_paper_kr_threshold_summary = {
+			"threshold": ratio_threshold,
+			"tensor_count": {
+				"total": tensor_count,
+				"greater_than_count": whole_tensor_paper_kr_greater_count,
+				"greater_than_percentage": whole_tensor_paper_kr_greater_count / tensor_count if tensor_count else math.nan,
+				"less_than_count": whole_tensor_paper_kr_less_count,
+				"equal_count": whole_tensor_paper_kr_equal_count,
+			},
+		}
 	return {
 		"model_dir": model_dir,
 		"model_name": model_name,
 		"group_size": group_size,
 		"device": device,
 		"paper_kr_percentile": kr_percentile,
+		"group_paper_kr_rule": "signed_endpoint",
+		"field_naming": {
+			"primary_tensor_fields": [
+				"mean_group_max_ratio",
+				"any_group_max_ratio",
+				"mean_group_paper_kr_ratio",
+				"any_group_paper_kr_ratio",
+				"whole_tensor_paper_kr_ratio",
+			],
+			"primary_summary_fields": [
+				"global_max_group_max_ratio",
+				"global_mean_group_max_ratio",
+				"global_max_mean_group_max_ratio",
+				"global_mean_mean_group_max_ratio",
+				"global_max_any_group_max_ratio",
+				"global_mean_any_group_max_ratio",
+				"global_max_group_paper_kr_ratio",
+				"global_mean_group_paper_kr_ratio",
+				"global_max_mean_group_paper_kr_ratio",
+				"global_mean_mean_group_paper_kr_ratio",
+				"global_max_any_group_paper_kr_ratio",
+				"global_mean_any_group_paper_kr_ratio",
+				"global_max_whole_tensor_paper_kr_ratio",
+				"global_mean_whole_tensor_paper_kr_ratio",
+			],
+			"compatibility_aliases": [
+				"max_ratio",
+				"max_group_ratio",
+				"paper_kr_ratio",
+				"paper_kr_max_group_ratio",
+				"global_max_ratio",
+				"global_mean_max_ratio",
+				"global_max_paper_kr_ratio",
+				"global_mean_paper_kr_ratio",
+			],
+		},
 		"tensor_count": len(tensor_records),
 		"skipped_count": len(skipped),
-		"global_max_ratio": sorted_records[0]["max_ratio"] if sorted_records else math.nan,
-		"global_mean_max_ratio": sum(ratios) / len(ratios) if ratios else math.nan,
-		"global_max_paper_kr_ratio": max(paper_kr_ratios) if paper_kr_ratios else math.nan,
-		"global_mean_paper_kr_ratio": sum(paper_kr_ratios) / len(paper_kr_ratios) if paper_kr_ratios else math.nan,
+		"global_max_group_max_ratio": global_max_group_ratio,
+		"global_mean_group_max_ratio": global_group_mean_ratio,
+		"global_max_mean_group_max_ratio": max(tensor_max_ratios) if tensor_max_ratios else math.nan,
+		"global_mean_mean_group_max_ratio": sum(tensor_max_ratios) / len(tensor_max_ratios) if tensor_max_ratios else math.nan,
+		"global_max_group_paper_kr_ratio": global_group_paper_kr_max_ratio,
+		"global_mean_group_paper_kr_ratio": global_group_paper_kr_mean_ratio,
+		"global_max_mean_group_paper_kr_ratio": max(tensor_paper_kr_ratios) if tensor_paper_kr_ratios else math.nan,
+		"global_mean_mean_group_paper_kr_ratio": sum(tensor_paper_kr_ratios) / len(tensor_paper_kr_ratios) if tensor_paper_kr_ratios else math.nan,
+		"global_max_any_group_max_ratio": max(tensor_any_group_max_ratios) if tensor_any_group_max_ratios else math.nan,
+		"global_mean_any_group_max_ratio": sum(tensor_any_group_max_ratios) / len(tensor_any_group_max_ratios) if tensor_any_group_max_ratios else math.nan,
+		"global_max_any_group_paper_kr_ratio": max(tensor_any_group_paper_kr_ratios) if tensor_any_group_paper_kr_ratios else math.nan,
+		"global_mean_any_group_paper_kr_ratio": sum(tensor_any_group_paper_kr_ratios) / len(tensor_any_group_paper_kr_ratios) if tensor_any_group_paper_kr_ratios else math.nan,
+		"global_max_whole_tensor_paper_kr_ratio": max(tensor_whole_tensor_paper_kr_ratios) if tensor_whole_tensor_paper_kr_ratios else math.nan,
+		"global_mean_whole_tensor_paper_kr_ratio": sum(tensor_whole_tensor_paper_kr_ratios) / len(tensor_whole_tensor_paper_kr_ratios) if tensor_whole_tensor_paper_kr_ratios else math.nan,
+		# Backward-compatible aliases for earlier JSON consumers.
+		"global_max_ratio": global_max_group_ratio,
+		"global_mean_max_ratio": global_group_mean_ratio,
+		"global_max_tensor_max_ratio": max(tensor_max_ratios) if tensor_max_ratios else math.nan,
+		"global_mean_tensor_max_ratio": sum(tensor_max_ratios) / len(tensor_max_ratios) if tensor_max_ratios else math.nan,
+		"global_max_tensor_any_group_max_ratio": max(tensor_any_group_max_ratios) if tensor_any_group_max_ratios else math.nan,
+		"global_mean_tensor_any_group_max_ratio": sum(tensor_any_group_max_ratios) / len(tensor_any_group_max_ratios) if tensor_any_group_max_ratios else math.nan,
+		"global_max_ratio_group_count": global_group_ratio_finite_count + global_group_ratio_infinite_count,
+		"global_max_paper_kr_ratio": global_group_paper_kr_max_ratio,
+		"global_mean_paper_kr_ratio": global_group_paper_kr_mean_ratio,
+		"global_max_tensor_paper_kr_ratio": max(tensor_paper_kr_ratios) if tensor_paper_kr_ratios else math.nan,
+		"global_mean_tensor_paper_kr_ratio": sum(tensor_paper_kr_ratios) / len(tensor_paper_kr_ratios) if tensor_paper_kr_ratios else math.nan,
+		"global_max_tensor_any_group_paper_kr_ratio": max(tensor_any_group_paper_kr_ratios) if tensor_any_group_paper_kr_ratios else math.nan,
+		"global_mean_tensor_any_group_paper_kr_ratio": sum(tensor_any_group_paper_kr_ratios) / len(tensor_any_group_paper_kr_ratios) if tensor_any_group_paper_kr_ratios else math.nan,
+		"global_max_legacy_tensor_paper_kr_ratio": max(tensor_whole_tensor_paper_kr_ratios) if tensor_whole_tensor_paper_kr_ratios else math.nan,
+		"global_mean_legacy_tensor_paper_kr_ratio": sum(tensor_whole_tensor_paper_kr_ratios) / len(tensor_whole_tensor_paper_kr_ratios) if tensor_whole_tensor_paper_kr_ratios else math.nan,
+		"global_paper_kr_group_count": global_group_paper_kr_finite_count + global_group_paper_kr_infinite_count,
 		"ratio_threshold_summary": threshold_summary,
 		"paper_kr_threshold_summary": paper_kr_threshold_summary,
-		"top_tensors": sorted_records[:topk],
+		"whole_tensor_paper_kr_threshold_summary": whole_tensor_paper_kr_threshold_summary,
+		"top_mean_group_tensors": sorted_records[:topk],
+		"top_any_group_tensors": any_group_sorted_records[:topk],
 		"skipped": skipped,
 	}
 
@@ -626,24 +851,33 @@ def get_layer_sort_key(layer_name: str, module_family: str) -> tuple[int, int, s
 
 
 def build_layer_aggregates(tensor_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-	layer_buckets: dict[tuple[str, str], list[float]] = {}
+	layer_buckets: dict[tuple[str, str], dict[str, list[float]]] = {}
 	for record in tensor_records:
-		paper_kr_ratio = record["paper_kr_ratio"]
-		if not math.isfinite(paper_kr_ratio):
+		paper_kr_ratio = record["mean_group_paper_kr_ratio"]
+		any_group_paper_kr_ratio = record["any_group_paper_kr_ratio"]
+		if not math.isfinite(paper_kr_ratio) and not math.isfinite(any_group_paper_kr_ratio):
 			continue
 		layer_name = extract_layer_name(record["name"])
 		module_family = get_module_family(record["name"])
-		layer_buckets.setdefault((layer_name, module_family), []).append(paper_kr_ratio)
+		bucket = layer_buckets.setdefault((layer_name, module_family), {"mean_group": [], "any_group": []})
+		if math.isfinite(paper_kr_ratio):
+			bucket["mean_group"].append(paper_kr_ratio)
+		if math.isfinite(any_group_paper_kr_ratio):
+			bucket["any_group"].append(any_group_paper_kr_ratio)
 
 	layer_records = []
 	for (layer_name, module_family), values in layer_buckets.items():
+		mean_group_values = values["mean_group"]
+		any_group_values = values["any_group"]
 		layer_records.append(
 			{
 				"layer_name": layer_name,
 				"module_family": module_family,
-				"tensor_count": len(values),
-				"mean_paper_kr_ratio": sum(values) / len(values),
-				"max_paper_kr_ratio": max(values),
+				"tensor_count": max(len(mean_group_values), len(any_group_values)),
+				"mean_paper_kr_ratio": sum(mean_group_values) / len(mean_group_values) if mean_group_values else math.nan,
+				"max_paper_kr_ratio": max(mean_group_values) if mean_group_values else math.nan,
+				"mean_any_group_paper_kr_ratio": sum(any_group_values) / len(any_group_values) if any_group_values else math.nan,
+				"max_any_group_paper_kr_ratio": max(any_group_values) if any_group_values else math.nan,
 				"sort_key": get_layer_sort_key(layer_name, module_family),
 			}
 		)
@@ -662,18 +896,20 @@ def plot_paper_kr_figure(
 	kr_percentile: float,
 	topk: int,
 	ratio_threshold: float | None,
+	metric_key: str,
+	metric_label: str,
 ) -> None:
 	import matplotlib
 
 	matplotlib.use("Agg")
 	import matplotlib.pyplot as plt
 
-	finite_records = [record for record in tensor_records if math.isfinite(record["paper_kr_ratio"])]
+	finite_records = [record for record in tensor_records if math.isfinite(record[metric_key])]
 	if not finite_records:
-		raise ValueError("No finite paper_kr_ratio values available for plotting")
+		raise ValueError(f"No finite {metric_key} values available for plotting")
 
-	sorted_records = sorted(finite_records, key=lambda item: item["paper_kr_ratio"], reverse=True)
-	rank_values = [record["paper_kr_ratio"] for record in sorted_records]
+	sorted_records = sorted(finite_records, key=lambda item: item[metric_key], reverse=True)
+	rank_values = [record[metric_key] for record in sorted_records]
 	ranks = list(range(1, len(rank_values) + 1))
 	top_count = min(topk, len(sorted_records), 15)
 	top_records = list(reversed(sorted_records[:top_count]))
@@ -690,7 +926,7 @@ def plot_paper_kr_figure(
 	curve_axis.plot(ranks, rank_values, color="#0f766e", linewidth=2.2)
 	curve_axis.fill_between(ranks, rank_values, color="#99f6e4", alpha=0.35)
 	curve_axis.scatter(ranks[:top_count], rank_values[:top_count], color="#134e4a", s=18, zorder=3)
-	curve_axis.set_title("Sorted paper-style K/r across tensors", fontsize=13, pad=10)
+	curve_axis.set_title(f"Sorted {metric_label} across tensors", fontsize=13, pad=10)
 	curve_axis.set_xlabel("Tensor rank", fontsize=11)
 	curve_axis.set_ylabel("K/r ratio", fontsize=11)
 	curve_axis.grid(alpha=0.25, linestyle="--", linewidth=0.8)
@@ -716,10 +952,10 @@ def plot_paper_kr_figure(
 	)
 
 	bar_labels = [shorten_tensor_name(record["name"]) for record in top_records]
-	bar_values = [record["paper_kr_ratio"] for record in top_records]
+	bar_values = [record[metric_key] for record in top_records]
 	bar_colors = ["#f97316" if index == len(top_records) - 1 else "#fb923c" for index in range(len(top_records))]
 	bar_axis.barh(bar_labels, bar_values, color=bar_colors)
-	bar_axis.set_title(f"Top {top_count} tensors by K/r", fontsize=13, pad=10)
+	bar_axis.set_title(f"Top {top_count} tensors by {metric_label}", fontsize=13, pad=10)
 	bar_axis.set_xlabel("K/r ratio", fontsize=11)
 	add_vertical_threshold_line(bar_axis, ratio_threshold)
 	bar_axis.grid(axis="x", alpha=0.25, linestyle="--", linewidth=0.8)
@@ -728,7 +964,7 @@ def plot_paper_kr_figure(
 		bar_axis.text(value, label_index, f" {format_metric(value)}", va="center", ha="left", fontsize=9)
 
 	figure.suptitle(
-		f"Tensor outlier profile for {model_name}",
+		f"Tensor outlier profile for {model_name} ({metric_label})",
 		fontsize=15,
 		fontweight="bold",
 	)
@@ -744,6 +980,9 @@ def plot_layer_paper_kr_figure(
 	output_path: str,
 	kr_percentile: float,
 	ratio_threshold: float | None,
+	mean_metric_key: str,
+	max_metric_key: str,
+	metric_label: str,
 ) -> None:
 	import matplotlib
 
@@ -774,8 +1013,8 @@ def plot_layer_paper_kr_figure(
 		max_values = []
 		for layer_name in ordered_layers:
 			record = record_lookup.get((layer_name, family))
-			mean_values.append(record["mean_paper_kr_ratio"] if record else math.nan)
-			max_values.append(record["max_paper_kr_ratio"] if record else math.nan)
+			mean_values.append(record[mean_metric_key] if record else math.nan)
+			max_values.append(record[max_metric_key] if record else math.nan)
 		axis.bar(
 			offsets,
 			mean_values,
@@ -797,7 +1036,7 @@ def plot_layer_paper_kr_figure(
 			zorder=3,
 			label=f"{family} max",
 		)
-	axis.set_title("Layer-ordered paper-style K/r by module family", fontsize=14, pad=10)
+	axis.set_title(f"Layer-ordered {metric_label} by module family", fontsize=14, pad=10)
 	axis.set_xlabel("Layer / module", fontsize=11)
 	axis.set_ylabel("K/r ratio", fontsize=11)
 	axis.set_xticks(x_positions)
@@ -806,15 +1045,15 @@ def plot_layer_paper_kr_figure(
 	axis.spines[["top", "right"]].set_visible(False)
 	add_threshold_line(axis, ratio_threshold)
 	axis.legend(frameon=False, loc="upper right", ncols=2, fontsize=9)
-	all_positive_means = [record["mean_paper_kr_ratio"] for record in layer_records if record["mean_paper_kr_ratio"] > 0]
-	all_max_values = [record["max_paper_kr_ratio"] for record in layer_records]
+	all_positive_means = [record[mean_metric_key] for record in layer_records if record[mean_metric_key] > 0]
+	all_max_values = [record[max_metric_key] for record in layer_records]
 	if all_positive_means and max(all_max_values) / min(all_positive_means) >= 20:
 		axis.set_yscale("log")
 
 	stats_text = (
 		f"aggregated layers = {len(layer_records)}\n"
 		f"max layer K/r = {format_metric(max(all_max_values))}\n"
-		f"mean layer K/r = {format_metric(sum(record['mean_paper_kr_ratio'] for record in layer_records) / len(layer_records))}\n"
+		f"mean layer K/r = {format_metric(sum(record[mean_metric_key] for record in layer_records) / len(layer_records))}\n"
 		f"r percentile = p{kr_percentile:.2f}"
 	)
 	axis.text(
@@ -829,7 +1068,7 @@ def plot_layer_paper_kr_figure(
 	)
 
 	figure.suptitle(
-		f"Layer outlier profile for {model_name}",
+		f"Layer outlier profile for {model_name} ({metric_label})",
 		fontsize=15,
 		fontweight="bold",
 	)
@@ -873,8 +1112,10 @@ def profile_model(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[s
 		tensor_records.append(stats)
 		print(
 			f"[TENSOR] {name} ({source_file}) "
-			f"max_ratio={format_metric(stats['max_ratio'])} "
-			f"paper_kr_ratio={format_metric(stats['paper_kr_ratio'])}"
+			f"mean_group_max_ratio={format_metric(stats['mean_group_max_ratio'])} "
+			f"any_group_max_ratio={format_metric(stats['any_group_max_ratio'])} "
+			f"mean_group_paper_kr_ratio={format_metric(stats['mean_group_paper_kr_ratio'])} "
+			f"any_group_paper_kr_ratio={format_metric(stats['any_group_paper_kr_ratio'])}"
 		)
 
 	return (
@@ -906,10 +1147,13 @@ def run(args: argparse.Namespace) -> None:
 		args.per_tensor_output = normalize_local_path(args.per_tensor_output)
 	if args.figure_output is None:
 		output_stem, _ = os.path.splitext(args.output)
-		args.figure_output = f"{output_stem}_paper_kr.png"
+		args.figure_output = f"{output_stem}_mean_group_paper_kr.png"
 	else:
 		args.figure_output = normalize_local_path(args.figure_output)
-	layer_figure_output = f"{os.path.splitext(args.figure_output)[0]}_by_layer.png"
+	mean_group_figure_output = args.figure_output
+	any_group_figure_output = f"{os.path.splitext(args.figure_output)[0].removesuffix('_mean_group_paper_kr')}_any_group_paper_kr.png"
+	mean_group_layer_figure_output = f"{os.path.splitext(mean_group_figure_output)[0]}_by_layer.png"
+	any_group_layer_figure_output = f"{os.path.splitext(any_group_figure_output)[0]}_by_layer.png"
 	model_name = resolve_model_display_name(args.input, args.model_name)
 
 	summary, tensor_records = profile_model(args)
@@ -917,29 +1161,108 @@ def run(args: argparse.Namespace) -> None:
 	save_json(args.output, summary)
 	if args.per_tensor_output:
 		save_jsonl(args.per_tensor_output, tensor_records)
-	plot_paper_kr_figure(model_dir=args.input, model_name=model_name, tensor_records=tensor_records, output_path=args.figure_output, kr_percentile=args.kr_percentile, topk=args.topk, ratio_threshold=args.ratio_threshold)
-	plot_layer_paper_kr_figure(model_dir=args.input, model_name=model_name, layer_records=layer_records, output_path=layer_figure_output, kr_percentile=args.kr_percentile, ratio_threshold=args.ratio_threshold)
+	plot_paper_kr_figure(
+		model_dir=args.input,
+		model_name=model_name,
+		tensor_records=tensor_records,
+		output_path=mean_group_figure_output,
+		kr_percentile=args.kr_percentile,
+		topk=args.topk,
+		ratio_threshold=args.ratio_threshold,
+		metric_key="mean_group_paper_kr_ratio",
+		metric_label="mean-group paper K/r",
+	)
+	plot_paper_kr_figure(
+		model_dir=args.input,
+		model_name=model_name,
+		tensor_records=tensor_records,
+		output_path=any_group_figure_output,
+		kr_percentile=args.kr_percentile,
+		topk=args.topk,
+		ratio_threshold=args.ratio_threshold,
+		metric_key="any_group_paper_kr_ratio",
+		metric_label="any-group paper K/r",
+	)
+	plot_layer_paper_kr_figure(
+		model_dir=args.input,
+		model_name=model_name,
+		layer_records=layer_records,
+		output_path=mean_group_layer_figure_output,
+		kr_percentile=args.kr_percentile,
+		ratio_threshold=args.ratio_threshold,
+		mean_metric_key="mean_paper_kr_ratio",
+		max_metric_key="max_paper_kr_ratio",
+		metric_label="mean-group paper K/r",
+	)
+	plot_layer_paper_kr_figure(
+		model_dir=args.input,
+		model_name=model_name,
+		layer_records=layer_records,
+		output_path=any_group_layer_figure_output,
+		kr_percentile=args.kr_percentile,
+		ratio_threshold=args.ratio_threshold,
+		mean_metric_key="mean_any_group_paper_kr_ratio",
+		max_metric_key="max_any_group_paper_kr_ratio",
+		metric_label="any-group paper K/r",
+	)
 	summary["model_name"] = model_name
-	summary["figure_output"] = args.figure_output
-	summary["layer_figure_output"] = layer_figure_output
-	summary["layer_topk"] = sorted(layer_records, key=lambda item: item["max_paper_kr_ratio"], reverse=True)[: args.topk]
+	summary["figure_output"] = mean_group_figure_output
+	summary["any_group_figure_output"] = any_group_figure_output
+	summary["layer_figure_output"] = mean_group_layer_figure_output
+	summary["any_group_layer_figure_output"] = any_group_layer_figure_output
+	summary["top_mean_group_layers"] = sorted(layer_records, key=lambda item: item["max_paper_kr_ratio"], reverse=True)[: args.topk]
+	summary["top_any_group_layers"] = sorted(layer_records, key=lambda item: item["max_any_group_paper_kr_ratio"], reverse=True)[: args.topk]
 	save_json(args.output, summary)
 
 	print(f"Profile saved to: {args.output}")
-	print(f"Figure saved to: {args.figure_output}")
-	print(f"Layer figure saved to: {layer_figure_output}")
+	print(f"Mean-group figure saved to: {mean_group_figure_output}")
+	print(f"Any-group figure saved to: {any_group_figure_output}")
+	print(f"Mean-group layer figure saved to: {mean_group_layer_figure_output}")
+	print(f"Any-group layer figure saved to: {any_group_layer_figure_output}")
 	print(f"Profiled tensors: {summary['tensor_count']}")
 	print(f"Skipped tensors: {summary['skipped_count']}")
-	print(f"Global max ratio: {summary['global_max_ratio']}")
 	print(
-		"Global paper-style K/r ratio: "
-		f"{summary['global_max_paper_kr_ratio']} "
+		"Global tensor mean-group max ratio: "
+		f"max={summary['global_max_mean_group_max_ratio']} "
+		f"mean={summary['global_mean_mean_group_max_ratio']}"
+	)
+	print(
+		"Global tensor any-group max ratio: "
+		f"max={summary['global_max_any_group_max_ratio']} "
+		f"mean={summary['global_mean_any_group_max_ratio']}"
+	)
+	print(
+		"Global group max ratio: "
+		f"max={summary['global_max_group_max_ratio']} "
+		f"mean={summary['global_mean_group_max_ratio']} "
+		f"across {summary['global_max_ratio_group_count']} groups"
+	)
+	print(
+		"Global tensor mean-group paper-style K/r: "
+		f"max={summary['global_max_mean_group_paper_kr_ratio']} "
+		f"mean={summary['global_mean_mean_group_paper_kr_ratio']}"
+	)
+	print(
+		"Global tensor any-group paper-style K/r: "
+		f"max={summary['global_max_any_group_paper_kr_ratio']} "
+		f"mean={summary['global_mean_any_group_paper_kr_ratio']}"
+	)
+	print(
+		"Global tensor whole-tensor paper-style K/r (legacy 690b2826... semantics): "
+		f"max={summary['global_max_whole_tensor_paper_kr_ratio']} "
+		f"mean={summary['global_mean_whole_tensor_paper_kr_ratio']} "
 		f"(r estimated by p={summary['paper_kr_percentile']})"
+	)
+	print(
+		"Global group paper-style K/r: "
+		f"max={summary['global_max_group_paper_kr_ratio']} "
+		f"mean={summary['global_mean_group_paper_kr_ratio']} "
+		f"across {summary['global_paper_kr_group_count']} groups"
 	)
 	if summary["ratio_threshold_summary"] is not None:
 		threshold_summary = summary["ratio_threshold_summary"]
 		print(
-			"Threshold summary (tensor max_ratio): "
+			"Threshold summary (tensor max_ratio, any group): "
 			f"> {threshold_summary['threshold']}: {threshold_summary['tensor_count']['greater_than_count']} "
 			f"({format_metric(threshold_summary['tensor_count']['greater_than_percentage'] * 100)}%), "
 			f"< {threshold_summary['threshold']}: {threshold_summary['tensor_count']['less_than_count']}, "
@@ -954,11 +1277,19 @@ def run(args: argparse.Namespace) -> None:
 		)
 		paper_kr_threshold_summary = summary["paper_kr_threshold_summary"]
 		print(
-			"Threshold summary (tensor paper K/r): "
+			"Threshold summary (tensor paper K/r, any group): "
 			f"> {paper_kr_threshold_summary['threshold']}: {paper_kr_threshold_summary['tensor_count']['greater_than_count']} "
 			f"({format_metric(paper_kr_threshold_summary['tensor_count']['greater_than_percentage'] * 100)}%), "
 			f"< {paper_kr_threshold_summary['threshold']}: {paper_kr_threshold_summary['tensor_count']['less_than_count']}, "
 			f"= {paper_kr_threshold_summary['threshold']}: {paper_kr_threshold_summary['tensor_count']['equal_count']}"
+		)
+		whole_tensor_paper_kr_threshold_summary = summary["whole_tensor_paper_kr_threshold_summary"]
+		print(
+			"Threshold summary (tensor paper K/r, whole tensor legacy 690b2826... semantics): "
+			f"> {whole_tensor_paper_kr_threshold_summary['threshold']}: {whole_tensor_paper_kr_threshold_summary['tensor_count']['greater_than_count']} "
+			f"({format_metric(whole_tensor_paper_kr_threshold_summary['tensor_count']['greater_than_percentage'] * 100)}%), "
+			f"< {whole_tensor_paper_kr_threshold_summary['threshold']}: {whole_tensor_paper_kr_threshold_summary['tensor_count']['less_than_count']}, "
+			f"= {whole_tensor_paper_kr_threshold_summary['threshold']}: {whole_tensor_paper_kr_threshold_summary['tensor_count']['equal_count']}"
 		)
 		print(
 			"Threshold summary (group paper K/r): "
