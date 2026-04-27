@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 
 from auto_round.utils import normalize_tied_weight_keys_for_save
 
@@ -117,6 +117,23 @@ def copy_remote_tokenizer_artifacts(model_source: str, output_dir: str, file_nam
 	for file_name in file_names:
 		source_path = hf_hub_download(repo_id=model_source, filename=file_name)
 		shutil.copy2(source_path, os.path.join(output_dir, file_name))
+
+
+def try_copy_model_config(model_source: str, output_dir: str) -> None:
+	try:
+		os.makedirs(output_dir, exist_ok=True)
+		if os.path.isdir(model_source):
+			source_path = os.path.join(model_source, "config.json")
+			if not os.path.exists(source_path):
+				print(f"Skip config copy: no config.json found in {model_source}")
+				return
+		else:
+			from huggingface_hub import hf_hub_download
+
+			source_path = hf_hub_download(repo_id=model_source, filename="config.json")
+		shutil.copy2(source_path, os.path.join(output_dir, "config.json"))
+	except Exception as exc:  # pylint: disable=broad-except
+		print(f"Skip config copy: {exc}")
 
 
 def try_save_tokenizer(model_source: str, output_dir: str):
@@ -234,6 +251,7 @@ def run(args):
 
 	normalize_tied_weight_keys_for_save(original_model)
 	original_model.save_pretrained(output_dir, safe_serialization=True)
+	try_copy_model_config(original_source, output_dir)
 	try_save_tokenizer(original_source, output_dir)
 	save_report(output_dir, report, original_source, quantized_source, operation)
 
