@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import shutil
 from typing import Any
 
 import torch
@@ -8,6 +9,23 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from auto_round.utils import normalize_tied_weight_keys_for_save
+
+
+TOKENIZER_ARTIFACT_NAMES = {
+	"added_tokens.json",
+	"chat_template.jinja",
+	"merges.txt",
+	"sentencepiece.bpe.model",
+	"special_tokens_map.json",
+	"spiece.model",
+	"tokenizer.json",
+	"tokenizer.jsonl",
+	"tokenizer.model",
+	"tokenizer_config.json",
+	"vocab.json",
+	"vocab.txt",
+	"tekken.json",
+}
 
 
 def get_option_parser():
@@ -65,13 +83,55 @@ def load_model(model_source: str):
 	)
 
 
+def should_copy_tokenizer_artifact(file_name: str) -> bool:
+	base_name = os.path.basename(file_name)
+	return "/" not in file_name and (
+		base_name in TOKENIZER_ARTIFACT_NAMES
+		or base_name.startswith("tokenizer.")
+		or base_name.startswith("tokenizer_")
+	)
+
+
+def list_local_tokenizer_artifacts(model_source: str) -> list[str]:
+	return sorted(
+		file_name
+		for file_name in os.listdir(model_source)
+		if os.path.isfile(os.path.join(model_source, file_name)) and should_copy_tokenizer_artifact(file_name)
+	)
+
+
+def list_remote_tokenizer_artifacts(model_source: str) -> list[str]:
+	from huggingface_hub import list_repo_files
+
+	return sorted(file_name for file_name in list_repo_files(model_source) if should_copy_tokenizer_artifact(file_name))
+
+
+def copy_local_tokenizer_artifacts(model_source: str, output_dir: str, file_names: list[str]) -> None:
+	for file_name in file_names:
+		shutil.copy2(os.path.join(model_source, file_name), os.path.join(output_dir, file_name))
+
+
+def copy_remote_tokenizer_artifacts(model_source: str, output_dir: str, file_names: list[str]) -> None:
+	from huggingface_hub import hf_hub_download
+
+	for file_name in file_names:
+		source_path = hf_hub_download(repo_id=model_source, filename=file_name)
+		shutil.copy2(source_path, os.path.join(output_dir, file_name))
+
+
 def try_save_tokenizer(model_source: str, output_dir: str):
 	try:
-		tokenizer = AutoTokenizer.from_pretrained(model_source, trust_remote_code=True)
+		os.makedirs(output_dir, exist_ok=True)
+		if os.path.isdir(model_source):
+			file_names = list_local_tokenizer_artifacts(model_source)
+			copy_local_tokenizer_artifacts(model_source, output_dir, file_names)
+		else:
+			file_names = list_remote_tokenizer_artifacts(model_source)
+			copy_remote_tokenizer_artifacts(model_source, output_dir, file_names)
+		if not file_names:
+			print(f"Skip tokenizer copy: no tokenizer artifacts found in {model_source}")
 	except Exception as exc:  # pylint: disable=broad-except
-		print(f"Skip tokenizer save: {exc}")
-		return
-	tokenizer.save_pretrained(output_dir)
+		print(f"Skip tokenizer copy: {exc}")
 
 
 def compute_residual_state(

@@ -326,7 +326,7 @@ def _imatrix_handle_zero(imatrix: Union[torch.Tensor, float], weight: torch.Tens
     if not isinstance(imatrix, torch.Tensor):
         return imatrix
 
-    group_size = 16 if bits == 2 else 32
+    group_size = 16 if bits in (1, 2, 3, 6) else 32
     imatrix = imatrix.reshape(-1, imatrix.shape[-1])
     if torch.min(imatrix) == 0:
         logger.warning_once(
@@ -337,12 +337,14 @@ def _imatrix_handle_zero(imatrix: Union[torch.Tensor, float], weight: torch.Tens
         replace_index = zero_cnt > group_size // 2
         if torch.sum(replace_index) > 0:
             ## fallback to no imatrix
-            if bits == 2:
+            if bits in (1, 2, 3, 6):
                 tmp_quant_weights = torch.abs(weight)
             elif bits == 4 or bits == 5:
                 sigma2 = torch.sum(torch.pow(weight, 2), dim=-1, keepdim=True) / 32  ## Note 32 is different from QK_K
                 av_x = torch.sqrt(sigma2)
                 tmp_quant_weights = torch.abs(weight) + av_x
+            else:
+                tmp_quant_weights = torch.abs(weight)
             tmp_quant_weights = tmp_quant_weights.to(imatrix.dtype)
             imatrix[replace_index, :] = tmp_quant_weights[replace_index, :]
         mean_replace_index = (zero_cnt > 0) & (zero_cnt <= group_size // 2)

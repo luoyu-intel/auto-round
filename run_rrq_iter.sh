@@ -42,19 +42,33 @@ case "$USE_LOW_GPU_MEM_USAGE" in
 		;;
 esac
 
+print_cache_and_skip() {
+	local step_name="$1"
+	local output_path="$2"
+	echo "[cache] Skip ${step_name}, output already exists: ${output_path}"
+}
+
 MODEL_NAME="$(basename "$MODEL_PATH")"
 OUTPUT_DIR="${OUTPUT_ROOT%/}/${MODEL_NAME}-${SCHEME}"
-
-export AUTO_ROUND_IMATRIX_FILE="${OUTPUT_ROOT%/}/imatrix.pt"
-# save the intermediate imatrix for auto-rounding
-python -m auto_round --model "$MODEL_PATH" --scheme "$SCHEME"  --iters 0 --output_dir "$OUTPUT_DIR"
-unset AUTO_ROUND_IMATRIX_FILE
-
+IMATRIX_FILE="${OUTPUT_ROOT%/}/imatrix.pt"
 BASE_OUTPUT_DIR="${OUTPUT_DIR}/${MODEL_NAME}-${SUFFIX}"
-rm -rf "$BASE_OUTPUT_DIR"
+
+if [[ -e "$IMATRIX_FILE" ]]; then
+	print_cache_and_skip "imatrix generation" "$IMATRIX_FILE"
+else
+	export AUTO_ROUND_IMATRIX_FILE="$IMATRIX_FILE"
+	# save the intermediate imatrix for auto-rounding
+	python -m auto_round --model "$MODEL_PATH" --scheme "$SCHEME"  --iters 0 --output_dir "$OUTPUT_DIR"
+	unset AUTO_ROUND_IMATRIX_FILE
+	rm -rf ${BASE_OUTPUT_DIR}
+fi
 
 
-auto-round-best --enable_alg_ext --lr 2e-3 --model "$MODEL_PATH" --scheme "$SCHEME" --format "fake" --output_dir "$OUTPUT_DIR" "${LOW_GPU_MEM_USAGE_ARGS[@]}"
+if [[ -e "$BASE_OUTPUT_DIR" ]]; then
+	print_cache_and_skip "base auto-round-best" "$BASE_OUTPUT_DIR"
+else
+	auto-round-best --enable_alg_ext --lr 2e-3 --model "$MODEL_PATH" --scheme "$SCHEME" --format "fake" --output_dir "$OUTPUT_DIR" "${LOW_GPU_MEM_USAGE_ARGS[@]}"
+fi
 
 PREV_MERGE_DIR="$BASE_OUTPUT_DIR"
 FINAL_OUTPUT_DIR="$BASE_OUTPUT_DIR"
@@ -67,9 +81,13 @@ for ((iteration = 0; iteration < ITERATION_COUNT; iteration++)); do
 
 	python get_residual.py -i "$MODEL_PATH" -q "$PREV_MERGE_DIR" -o "$OUTPUT_RESIDUAL_DIR" --operation sub --device cpu
 
-	export AUTO_ROUND_LOAD_IMATRIX_FILE="${OUTPUT_ROOT%/}/imatrix.pt"
-	python -m auto_round --model "$OUTPUT_RESIDUAL_DIR" --scheme "$SCHEME" --format "fake" --iters 0 --output_dir "$OUTPUT_RESIDUAL_QUANT_DIR" --asym "${LOW_GPU_MEM_USAGE_ARGS[@]}"
-	unset AUTO_ROUND_LOAD_IMATRIX_FILE
+	if [[ -e "$RESIDUAL_OUTPUT_DIR" ]]; then
+		print_cache_and_skip "R${iteration} residual auto_round" "$RESIDUAL_OUTPUT_DIR"
+	else
+		export AUTO_ROUND_LOAD_IMATRIX_FILE="$IMATRIX_FILE"
+		python -m auto_round --model "$OUTPUT_RESIDUAL_DIR" --scheme "$SCHEME" --format "fake" --iters 0 --output_dir "$OUTPUT_RESIDUAL_QUANT_DIR" --asym "${LOW_GPU_MEM_USAGE_ARGS[@]}"
+		unset AUTO_ROUND_LOAD_IMATRIX_FILE
+	fi
 
 	python get_residual.py -i "$PREV_MERGE_DIR" -q "$RESIDUAL_OUTPUT_DIR" -o "$OUTPUT_RESIDUAL_MERGE_DIR" --operation add --device cpu
 
