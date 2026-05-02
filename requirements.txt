@@ -3,6 +3,7 @@ accelerate
 datasets
 numpy
 py-cpuinfo
+sentencepiece
 threadpoolctl
 torch
 tqdm
