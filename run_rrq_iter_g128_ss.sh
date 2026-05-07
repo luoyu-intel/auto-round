@@ -55,15 +55,11 @@ esac
 MODEL_NAME="$(basename "$MODEL_PATH")"
 OUTPUT_DIR="${OUTPUT_ROOT%/}/${MODEL_NAME}-${SCHEME}"
 
+BASE_OUTPUT_DIR="${OUTPUT_DIR}/${MODEL_NAME}-w2g32"
+
 export AUTO_ROUND_IMATRIX_FILE="${OUTPUT_ROOT%/}/imatrix.pt"
-# save the intermediate imatrix for auto-rounding
-python -m auto_round --model "$MODEL_PATH" --scheme "$SCHEME"  --iters 0 --output_dir "$OUTPUT_DIR" --group 128
+python -m auto_round --model "$MODEL_PATH" --scheme "$SCHEME"  --format "fake" --iters 0 --output_dir "$OUTPUT_DIR" "${LOW_GPU_MEM_USAGE_ARGS[@]}" --group 32
 unset AUTO_ROUND_IMATRIX_FILE
-
-BASE_OUTPUT_DIR="${OUTPUT_DIR}/${MODEL_NAME}-${SUFFIX}"
-rm -rf "$BASE_OUTPUT_DIR"
-
-python -m auto_round --model "$MODEL_PATH" --scheme "$SCHEME"  --format "fake" --iters 200 --output_dir "$OUTPUT_DIR" "${LOW_GPU_MEM_USAGE_ARGS[@]}" --group 128
 
 PREV_MERGE_DIR="$BASE_OUTPUT_DIR"
 FINAL_OUTPUT_DIR="$BASE_OUTPUT_DIR"

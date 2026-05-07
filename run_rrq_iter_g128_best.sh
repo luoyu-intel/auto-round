@@ -120,7 +120,7 @@ for ((iteration = 0; iteration < ITERATION_COUNT; iteration++)); do
 		STEP_START_TS="$(date +%s)"
 		log_time "R${iteration}: start residual auto_round"
 		export AUTO_ROUND_LOAD_IMATRIX_FILE="$IMATRIX_FILE"
-		python -m auto_round --model "$OUTPUT_RESIDUAL_DIR" --scheme "$SCHEME" --format "fake" --iters 0 --output_dir "$OUTPUT_RESIDUAL_QUANT_DIR" --asym "${LOW_GPU_MEM_USAGE_ARGS[@]}"
+		python -m auto_round --model "$OUTPUT_RESIDUAL_DIR" --scheme "$SCHEME" --format "fake" --iters 0 --output_dir "$OUTPUT_RESIDUAL_QUANT_DIR" "${LOW_GPU_MEM_USAGE_ARGS[@]}"
 		unset AUTO_ROUND_LOAD_IMATRIX_FILE
 		log_time "R${iteration}: finish residual auto_round"
 		print_elapsed "$STEP_START_TS"
