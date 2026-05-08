@@ -327,11 +327,21 @@ def quant_tensor_rtn_sym(tensor, bits=4, group_size=-1, v=0, q_scale_thresh=1e-5
         imatrix = imatrix.reshape(tensor.shape)
 
         imatrix = _imatrix_handle_zero(imatrix, tensor, bits)
-
-    scale = search_scales(tensor, bits, qw=imatrix)
-    scale = torch.where(scale < 0, torch.clamp(scale, max=-q_scale_thresh), torch.clamp(scale, min=q_scale_thresh))
-    int_w = tensor.div(scale).round_().clamp_(-maxq, maxq - 1)
-    qdq_result = (int_w.mul_(scale)).to(tensor.dtype)
+    if True:
+        q, scale = dynamic_quantize_tensor(
+            tensor,
+            bits=bits,
+            dir=-1,
+            asym=False,
+            iter=DEFAULT_DYNAMIC_QUANT_ITER,
+            qw=imatrix,
+        )
+        qdq_result = (scale * q).to(tensor.dtype)
+    else:
+        scale = search_scales(tensor, bits, qw=imatrix)
+        scale = torch.where(scale < 0, torch.clamp(scale, max=-q_scale_thresh), torch.clamp(scale, min=q_scale_thresh))
+        int_w = tensor.div(scale).round_().clamp_(-maxq, maxq - 1)
+        qdq_result = (int_w.mul_(scale)).to(tensor.dtype)
     qdq_result = revert_tensor_by_pad(qdq_result, orig_shape=orig_shape, pad_len=pad_len)
     return qdq_result, scale, maxq
 
